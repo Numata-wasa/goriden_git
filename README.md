@@ -1,3 +1,2 @@
-# goriden_git
-test
+# ゴリ電
 種子島ロケットコンテスト2026のゴリ電用GitHubです．
