@@ -138,7 +138,7 @@ void bmisetup(){
   delay(50);
 
   // 3. 測定レンジを±3gに設定
-  writeRegister(ACC_ADDRESS, ACC_RANGE, 0x00); // 0x00: ±3g, 0x01: ±6g, 0x02: ±12g, 0x03: ±24g
+  writeRegister(ACC_ADDRESS, ACC_RANGE, 0x02); // 0x00: ±3g, 0x01: ±6g, 0x02: ±12g, 0x03: ±24g
 
   // 4. ODRを100Hz, Normal BWPに設定
   writeRegister(ACC_ADDRESS, ACC_CONF, 0xA8); // ODR=100Hz, BWP=Normal
