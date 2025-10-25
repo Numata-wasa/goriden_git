@@ -1,13 +1,15 @@
 /***************************************************************************
- * This sketch reads data from a GPS module via Hardware Serial
- * and logs it to an SD card in CSV format every second, regardless of
- * whether the GPS location has been updated.
+ * 高速ロギング（200Hz）対応版
+ * * 修正:
+ * 1. SD.open() を setup() に移動し、ファイルを開きっぱなしにする
+ * 2. 1秒ごとに dataFile.flush() を呼び出すタイマーを追加
+ * 3. loop() 内の String を廃止し、char配列 (logBuffer) と snprintf() に変更
+ * 4. GPS時刻の1/100秒取得を .cs() から .centisecond() に修正
  ***************************************************************************/
+
 //エラーランプの点灯の設定
 const int error_ledpin = 41; //エラーランプ
 const int stat_ledpin = 42; //STATランプ（GPSに合わせて点灯させたい）
-
-
 
 // 共通ライブラリ
 #include <SPI.h>
@@ -34,7 +36,7 @@ HardwareSerial ss(1); // ハードウェアシリアルの1番を使用
 
 SPIClass spi;
 const char* fileName = "/fulldata.csv";
-File dataFile;
+File dataFile; // ★グローバル変数として保持
 // ===============
 
 // ===== BME =====
@@ -48,10 +50,13 @@ Adafruit_BME280 bme; // I2C
 
 // ★追加: 時間管理用の変数
 unsigned long lastLogTime = 0;
-const long logInterval = 50; // ログを記録する間隔 (ミリ秒) 今は２０Hz 
+const long logInterval = 5; // ログを記録する間隔 (ミリ秒) 200Hz
+
+// ★SDカードフラッシュ（物理書き込み）用タイマー
+unsigned long lastFlushTime = 0;
+const long flushInterval = 1000; // 1秒 (1000ms) に1回、バッファをSDに書き込む
 //================================================================
 // BMI088 I2C Addresses
-// SDOピンのGND/VCC接続によってアドレスが変わる場合があります
 //================================================================
 #define ACC_ADDRESS 0x19  // 加速度センサーのI2Cアドレス (SDO=VCC)
 #define GYRO_ADDRESS 0x69 // ジャイロセンサーのI2Cアドレス (SDO=VCC)
@@ -79,13 +84,8 @@ const long logInterval = 50; // ログを記録する間隔 (ミリ秒) 今は�
 //================================================================
 // 物理量変換のためのスケールファクタ
 //================================================================
-// 加速度の測定レンジ (±3g) に対応
-// LSB Sensitivity: 2^15 / 3g = 32768 / 3
-const float ACC_SCALE = 3.0f / 32768.0f; 
+const float ACC_SCALE = 3.0f / 32768.0f;
 const float G_TO_MS2 = 9.80665f; // 重力加速度
-
-// ジャイロの測定レンジ (±2000 dps) に対応
-// LSB Sensitivity: 2^15 / 2000dps = 32768 / 2000
 const float GYRO_SCALE = 2000.0f / 32768.0f;
 
 // センサーデータを格納する構造体
@@ -98,9 +98,7 @@ int cx = 0;
 int cy = 0;
 int cz = 0;
 
-
 SensorData sensorData;
-
 QMC5883LCompass compass;
 
 //================================================================
@@ -129,44 +127,26 @@ void bmisetup(){
 
   //---- Accelerometer Initialization ----
   Serial.println("Initializing Accelerometer...");
-  // 1. ソフトリセット
   writeRegister(ACC_ADDRESS, ACC_SOFTRESET, 0xB6);
   delay(100);
-  
-  // 2. センサーを有効化
   writeRegister(ACC_ADDRESS, ACC_PWR_CTRL, 0x04);
   delay(50);
-
-  // 3. 測定レンジを±3gに設定
-  writeRegister(ACC_ADDRESS, ACC_RANGE, 0x02); // 0x00: ±3g, 0x01: ±6g, 0x02: ±12g, 0x03: ±24g
-
-  // 4. ODRを100Hz, Normal BWPに設定
-  writeRegister(ACC_ADDRESS, ACC_CONF, 0xA8); // ODR=100Hz, BWP=Normal
-
-  // 5. 電源モードをActiveに設定
+  writeRegister(ACC_ADDRESS, ACC_RANGE, 0x02); // ±12g
+  writeRegister(ACC_ADDRESS, ACC_CONF, 0xA8); // ODR=100Hz
   writeRegister(ACC_ADDRESS, ACC_PWR_CONF, 0x00);
   delay(10);
   Serial.println("Accelerometer Initialized.");
 
   //---- Gyroscope Initialization ----
   Serial.println("Initializing Gyroscope...");
-  // 1. ソフトリセット
   writeRegister(GYRO_ADDRESS, GYRO_SOFTRESET, 0xB6);
   delay(100);
-
-  // 2. 測定レンジを±2000dpsに設定
-  writeRegister(GYRO_ADDRESS, GYRO_RANGE, 0x00); // 0x00: ±2000dps, 0x01: ±1000dps, ...
-
-  // 3. ODRを100Hz, Bandwidthを12Hzに設定
-  writeRegister(GYRO_ADDRESS, GYRO_BANDWIDTH, 0x88); // ODR=100Hz, BW=12Hz
-
-  // 4. 電源モードをNormalに設定
+  writeRegister(GYRO_ADDRESS, GYRO_RANGE, 0x00); // ±2000dps
+  writeRegister(GYRO_ADDRESS, GYRO_BANDWIDTH, 0x88); // ODR=100Hz
   writeRegister(GYRO_ADDRESS, GYRO_LPM1, 0x00);
   delay(50);
   Serial.println("Gyroscope Initialized.");
   Serial.println("----------------------------------------");
-
-
 }
 
 void bmieget(){
@@ -174,43 +154,35 @@ void bmieget(){
 
   //---- Read Accelerometer Data ----
   readRegisters(ACC_ADDRESS, ACC_DATA_START, buffer, 6);
-  // 16-bitの生データに結合 (リトルエンディアン)
   int16_t raw_ax = (int16_t)((buffer[1] << 8) | buffer[0]);
   int16_t raw_ay = (int16_t)((buffer[3] << 8) | buffer[2]);
   int16_t raw_az = (int16_t)((buffer[5] << 8) | buffer[4]);
-  // 物理量に変換
   sensorData.ax = raw_ax * ACC_SCALE * G_TO_MS2;
   sensorData.ay = raw_ay * ACC_SCALE * G_TO_MS2;
   sensorData.az = raw_az * ACC_SCALE * G_TO_MS2;
 
   //---- Read Gyroscope Data ----
   readRegisters(GYRO_ADDRESS, GYRO_DATA_START, buffer, 6);
-  // 16-bitの生データに結合 (リトルエンディアン)
   int16_t raw_gx = (int16_t)((buffer[1] << 8) | buffer[0]);
   int16_t raw_gy = (int16_t)((buffer[3] << 8) | buffer[2]);
   int16_t raw_gz = (int16_t)((buffer[5] << 8) | buffer[4]);
-  // 物理量に変換
   sensorData.gx = raw_gx * GYRO_SCALE;
   sensorData.gy = raw_gy * GYRO_SCALE;
   sensorData.gz = raw_gz * GYRO_SCALE;
-
 }
 
 void qmcsetup(){
-
     compass.init();
     Serial.println("QMC initialized");
-
 }
 
 void qmcget(){
     compass.read();
-
     cx = compass.getX();
     cy = compass.getY();
     cz = compass.getZ();
-
 }
+
 
 void setup() {
     pinMode(error_ledpin, OUTPUT ); //ERRORのLEDを
@@ -218,8 +190,7 @@ void setup() {
 
     // シリアルモニターを開始
     Serial.begin(115200);
-    //while (!Serial); //シリアルモニタが開くまで待つのはコメントアウトしてます
-    Serial.println("\nGPS Data Logger to SD Card (1-second interval)"); //面倒なのでそのまま
+    Serial.println("\nHigh-Speed GPS/IMU Data Logger");
 
     // SPIバスを初期化
     spi.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN, SD_CS_PIN);
@@ -227,8 +198,7 @@ void setup() {
     //I2C開始
     Wire.begin(I2C_SDA, I2C_SCL);
 
-    bool status = bme.begin(0x76); //addres
-
+    bool status = bme.begin(0x76); //address
     bmisetup();
     qmcsetup();
 
@@ -249,23 +219,26 @@ void setup() {
     }
     Serial.println("SD card initialized.");
 
-    // CSVヘッダーを書き込み
+    // ★★★ 変更点: ファイルを一度だけ開く ★★★
     dataFile = SD.open(fileName, FILE_WRITE);
     if (dataFile) {
-        dataFile.println("Date,Time,Lat,Lng,Sat,Alt,Temp,Pres,PrAl,Humi,ax,ay,az,gx,gy,gz,cx,cy,cz");
-        dataFile.close();
+        // ヘッダーに millis を追加
+        dataFile.println("Date,Time_cs,millis,Lat,Lng,Sat,Alt,Temp,Pres,PrAl,Humi,ax,ay,az,gx,gy,gz,cx,cy,cz");
+        
+        // ★★★ 変更点: ここで close() しない ★★★
+        // dataFile.close(); 
+        
         Serial.print("Header written to ");
         Serial.println(fileName);
     } else {
         Serial.print("Error opening ");
         digitalWrite(error_ledpin, HIGH);
         Serial.println(fileName);
+        while (1); // 停止
     }
-    Serial.println();
+    Serial.println("Start logging");
 
-    qmcsetup();
-
-
+    // qmcsetup(); // 2回呼び出されていたので1つコメントアウト
 }
 
 void loop() {
@@ -281,122 +254,139 @@ void loop() {
         digitalWrite(stat_ledpin, LOW);
     }
 
+    unsigned long currentMillis = millis();
 
-    // ★修正: 前回のログ記録から指定した時間が経過したかチェック
-    if (millis() - lastLogTime >= logInterval) {
+    // ★修正: メインの高速ロギングタイマー
+    if (currentMillis - lastLogTime >= logInterval) {
         // 最後にログを記録した時間を更新
-        lastLogTime = millis();
+        lastLogTime = currentMillis;
 
-        String dataString = "";
+        // ★★★ 変更点: String を廃止し、char 配列 (C言語文字列) を使用 ★★★
+        char logBuffer[512]; // ログ一行を格納するバッファ。サイズは余裕を持って
+        char tempBuffer[50]; // 浮動小数点数などを一時的に文字列に変換するため
 
-        // --- 日付 ---
-        if (gps.date.isValid()) {
-            char dateBuffer[11];
-            snprintf(dateBuffer, sizeof(dateBuffer), "%04d-%02d-%02d", gps.date.year(), gps.date.month(), gps.date.day());
-            dataString += String(dateBuffer);
-        } else {
-            dataString += "N/A"; // データが無効な場合
-        }
-        dataString += ",";
-
-        // --- 時刻 ---
-        if (gps.time.isValid()) {
-            char timeBuffer[9];
-            snprintf(timeBuffer, sizeof(timeBuffer), "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
-            dataString += String(timeBuffer);
-        } else {
-            dataString += "N/A"; // データが無効な場合
-        }
-        dataString += ",";
-        
-        // --- 緯度 ---
-        if (gps.location.isValid()) {
-            dataString += String(gps.location.lat(), 6);
-        } else {
-            dataString += "0.000000"; // データが無効な場合
-        }
-        dataString += ",";
-
-        // --- 経度 ---
-        if (gps.location.isValid()) {
-            dataString += String(gps.location.lng(), 6);
-        } else {
-            dataString += "0.000000"; // データが無効な場合
-        }
-        dataString += ",";
-
-        // --- 衛星の数 ---
-        if (gps.satellites.isValid()) {
-            dataString += String(gps.satellites.value());
-        } else {
-            dataString += "0"; // データが無効な場合
-        }
-        dataString += ",";
-
-        // --- 高度 ---
-        if (gps.altitude.isValid()) {
-            dataString += String(gps.altitude.meters());
-        } else {
-            dataString += "0.0"; // データが無効な場合
-        }
-        dataString += ",";
-        // ==================================
-
-        // ============= BME ================
-        dataString += String(bme.readTemperature());
-        dataString += ",";
-        dataString += String(bme.readPressure() / 100.0F);
-        dataString += ",";
-        dataString += String(bme.readAltitude(SEALEVELPRESSURE_HPA));
-        dataString += ",";
-        dataString += String(bme.readHumidity());
-        dataString += ",";
-        // ==================================
-
-        // =========== BMI ==================
+        // --- センサーデータを先にすべて取得 ---
+        // (BME)
+        float temp = bme.readTemperature();
+        float pres = bme.readPressure() / 100.0F;
+        float alt = bme.readAltitude(SEALEVELPRESSURE_HPA);
+        float hum = bme.readHumidity();
+        // (BMI)
         bmieget();
-
-        dataString += String(sensorData.ax, 4);
-        dataString += ",";
-        dataString += String(sensorData.ay, 4);
-        dataString += ",";
-        dataString += String(sensorData.az, 4);
-        dataString += ",";
-        dataString += String(sensorData.gx, 4);
-        dataString += ",";
-        dataString += String(sensorData.gy, 4);
-        dataString += ",";
-        dataString += String(sensorData.gz, 4);
-        dataString += ",";
-
-        // =========== QMC ==================
+        // (QMC)
         qmcget();
 
-        dataString += String(cx);
-        dataString += ",";
-        dataString += String(cy);
-        dataString += ",";
-        dataString += String(cz);
-        // ==================================
-
-
-
-        // データをシリアルモニタに表示
-        // 本番（直前）に消す！！
-        //Serial.println("--- Logging data (Interval) ---");
-        //Serial.println(dataString);
-
-        // データをSDカードに追記
-        dataFile = SD.open(fileName, FILE_APPEND);
-        if (dataFile) {
-            dataFile.println(dataString);
-            dataFile.close();
-            //Serial.println("Data saved to SD card.");
+        // --- GPS Date ---
+        if (gps.date.isValid()) {
+            snprintf(tempBuffer, sizeof(tempBuffer), "%04d-%02d-%02d", gps.date.year(), gps.date.month(), gps.date.day());
         } else {
-            Serial.print("Error opening ");
-            digitalWrite(error_ledpin, HIGH);
-            Serial.println(fileName);
+            strcpy(tempBuffer, "N/A");
         }
-        //Serial.println("-------------------------");
+        strcpy(logBuffer, tempBuffer); // バッファの先頭にコピー
+        strcat(logBuffer, ","); // 連結
+
+        // --- GPS Time (1/100秒まで記録する) ---
+        if (gps.time.isValid()) {
+            // ★★★★★★★ ここを .centisecond() に修正 ★★★★★★★
+            snprintf(tempBuffer, sizeof(tempBuffer), "%02d:%02d:%02d.%02d", 
+                     gps.time.hour(), 
+                     gps.time.minute(), 
+                     gps.time.second(),
+                     gps.time.centisecond()); // ★修正済み★
+        } else {
+            strcpy(tempBuffer, "N/A");
+        }
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+
+        // --- Millis ---
+        // ltoa (long to alpha) で数値を文字列に変換
+        ltoa(currentMillis, tempBuffer, 10);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+
+        // --- GPS Location ---
+        dtostrf(gps.location.isValid() ? gps.location.lat() : 0.0, 4, 6, tempBuffer); // (値, 最小幅, 少数点以下桁数, 格納先)
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        dtostrf(gps.location.isValid() ? gps.location.lng() : 0.0, 4, 6, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+
+        // --- GPS Satellites & Altitude ---
+        ltoa(gps.satellites.isValid() ? gps.satellites.value() : 0, tempBuffer, 10);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        dtostrf(gps.altitude.isValid() ? gps.altitude.meters() : 0.0, 4, 2, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+
+        // --- BME ---
+        dtostrf(temp, 4, 2, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        dtostrf(pres, 4, 2, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        dtostrf(alt, 4, 2, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        dtostrf(hum, 4, 2, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+
+        // --- BMI ---
+        dtostrf(sensorData.ax, 4, 4, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        dtostrf(sensorData.ay, 4, 4, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        dtostrf(sensorData.az, 4, 4, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        dtostrf(sensorData.gx, 4, 4, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        dtostrf(sensorData.gy, 4, 4, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        dtostrf(sensorData.gz, 4, 4, tempBuffer);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+
+        // --- QMC ---
+        ltoa(cx, tempBuffer, 10);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        ltoa(cy, tempBuffer, 10);
+        strcat(logBuffer, tempBuffer);
+        strcat(logBuffer, ",");
+        ltoa(cz, tempBuffer, 10);
+        strcat(logBuffer, tempBuffer);
+        // 最後のデータなので , は不要
+
+        // ★★★ 変更点: バッファ (RAM) に高速書き込み ★★★
+        if (dataFile) {
+            dataFile.println(logBuffer);
+        } else {
+            Serial.println("SD card file handle lost!");
+            digitalWrite(error_ledpin, HIGH);
+        }
+    }
+
+
+    // ★★★ 追加: SDカードへの物理書き込み (Flush) タイマー ★★★
+    // 5msのログ処理とは別に、1秒に1回だけ実行
+    if (currentMillis - lastFlushTime >= flushInterval) {
+        lastFlushTime = currentMillis;
+
+        if (dataFile) {
+            dataFile.flush(); // バッファをSDカードに書き込む
+            // Serial.println("Flashed buffer to SD."); // デバッグ用
+        } else {
+            Serial.println("SD card file handle lost! Cannot flush.");
+            digitalWrite(error_ledpin, HIGH);
+        }
     }
 }
