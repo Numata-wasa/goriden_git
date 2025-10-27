@@ -1,22 +1,27 @@
 /***************************************************************************
- * 高速ロギング デュアルコア (FreeRTOS) 対応版
- *
- * Core 1 (loop): 5msタイマーでの高速ロギングとSDフラッシュを担当
- * Core 0 (sensorReadTask): 全てのI2Cセンサーの読み取りを専門に担当
+ * 最終形態: 高速バイナリロガー (FreeRTOS 3タスク構成)
+ * * - Task A (Core 0, Prio 2): sensorTask
+ * - vTaskDelayUntil() を使い、正確な 5ms (200Hz) 間隔でセンサーを読み取る
+ * - データを「キュー」に送信
+ * - Task B (Core 1, Prio 1): sdWriteTask
+ * - キューからデータを受信
+ * - dataFile.write() で「バイナリ struct」をSDバッファに高速書き込み
+ * - Task C (Core 1, Prio 0): sdFlushTask
+ * - 1秒に1回、dataFile.flush() を実行 (低優先度)
  ***************************************************************************/
-
-//エラーランプの点灯の設定
-const int error_ledpin = 41; //エラーランプ
-const int stat_ledpin = 42; //STATランプ（GPSに合わせて点灯させたい）
 
 // 共通ライブラリ
 #include <SPI.h>
 #include <SD.h>
 #include <TinyGPSPlus.h>
-#include <Wire.h> // I2C通信に必要
+#include <Wire.h> 
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <QMC5883LCompass.h>
+
+//エラーランプ
+const int error_ledpin = 41; 
+const int stat_ledpin = 42; 
 
 // ===== GPS =====
 static const int RXPin = 7, TXPin = 6; 
@@ -26,13 +31,13 @@ HardwareSerial ss(1);
 // ===============
 
 // ===== SD =====
-#define SD_CS_PIN      2  // チップセレクトピン
-#define SPI_MOSI_PIN   4  // MOSIピン
-#define SPI_MISO_PIN   3  // MISOピン
-#define SPI_SCK_PIN    1  // SCKピン
+#define SD_CS_PIN      2  
+#define SPI_MOSI_PIN   4  
+#define SPI_MISO_PIN   3  
+#define SPI_SCK_PIN    1  
 
 SPIClass spi;
-const char* fileName = "/fulldata.csv";
+const char* fileName = "/fulldata.bin"; // ★CSVではなくバイナリ
 File dataFile; 
 // ===============
 
@@ -41,19 +46,10 @@ File dataFile;
 #define I2C_SDA 17
 #define I2C_SCL 16
 
-Adafruit_BME280 bme; // I2C
+Adafruit_BME280 bme; 
 // ==============
 
-// ===== 時間管理 =====
-unsigned long lastLogTime = 0;
-const long logInterval = 5; // 200Hz
-
-unsigned long lastFlushTime = 0;
-const long flushInterval = 1000; // 1秒に1回フラッシュ
-//================================================================
-
-// ... (BMI088, QMC5883L の定義) ...
-// (元のコードの #define ACC_ADDRESS ... から SensorData sensorData; までをそのまま挿入)
+// ... (BMI088, QMC5883L の定義 ...
 //================================================================
 // BMI088 I2C Addresses
 //================================================================
@@ -87,48 +83,71 @@ const float ACC_SCALE = 3.0f / 32768.0f;
 const float G_TO_MS2 = 9.80665f; // 重力加速度
 const float GYRO_SCALE = 2000.0f / 32768.0f;
 
-// センサーデータを格納する構造体
-struct SensorData {
-  float ax, ay, az; // Accelerometer data [m/s^2]
-  float gx, gy, gz; // Gyroscope data [dps]
-};
-
-int cx = 0;
-int cy = 0;
-int cz = 0;
-
-
-SensorData sensorData;
-
 QMC5883LCompass compass;
 
 //================================================================
-// ★★★ デュアルコア対応 ★★★
+// ★★★ バイナリロギング用 構造体 (Struct) ★★★
 //================================================================
-TaskHandle_t hSensorTask; // センサータスクのハンドル
-SemaphoreHandle_t dataMutex; // データ保護用のミューテックス
-
-// 2つのコアで共有するセンサーデータ
-// BMEのデータを追加
-struct SharedSensorData {
-  SensorData bmi; // BMI088
-  float temp, pres, alt, hum; // BME280
-  int cx, cy, cz; // QMC5883L
+// 構造体のパッキングを指示 (メモリ配置を最適化)
+#pragma pack(push, 1) 
+struct LogEntry {
+  uint32_t timestamp; // millis()
+  
+  // BME
+  float temp;
+  float pres;
+  float alt;
+  float hum;
+  
+  // BMI (Acc)
+  float ax;
+  float ay;
+  float az;
+  
+  // BMI (Gyro)
+  float gx;
+  float gy;
+  float gz;
+  
+  // QMC
+  int16_t cx; // int ではなく int16_t に
+  int16_t cy;
+  int16_t cz;
+  
+  // GPS
+  int32_t lat; // float(6桁) は 32bit int に
+  int32_t lng;
+  float    gps_alt;
+  uint8_t  sats;
+  uint16_t date_year;
+  uint8_t  date_month;
+  uint8_t  date_day;
+  uint8_t  time_hour;
+  uint8_t  time_min;
+  uint8_t  time_sec;
+  uint8_t  time_cs; // 1/100秒
 };
+#pragma pack(pop)
 
-// volatile: コンパイラの最適化を無効にし、常にメモリから読み込む
-volatile SharedSensorData g_sharedData; 
 //================================================================
+// ★★★ FreeRTOS タスク設定 ★★★
+//================================================================
+TaskHandle_t hSensorTask;
+TaskHandle_t hSdWriteTask;
+TaskHandle_t hSdFlushTask;
+QueueHandle_t xQueue; // タスク間通信用のキュー
+
+// キューに溜められるログの最大数
+#define QUEUE_LENGTH 50
 
 
-// ... (I2Cヘルパー関数 writeRegister, readRegisters は変更なし) ...
+// (I2Cヘルパー関数 writeRegister, readRegisters は変更なし)
 void writeRegister(uint8_t i2c_addr, uint8_t reg_addr, uint8_t value) {
   Wire.beginTransmission(i2c_addr);
   Wire.write(reg_addr);
   Wire.write(value);
   Wire.endTransmission();
 }
-
 void readRegisters(uint8_t i2c_addr, uint8_t reg_addr, uint8_t* buffer, uint8_t len) {
   Wire.beginTransmission(i2c_addr);
   Wire.write(reg_addr);
@@ -139,135 +158,167 @@ void readRegisters(uint8_t i2c_addr, uint8_t reg_addr, uint8_t* buffer, uint8_t 
   }
 }
 
-
-// ... (bmisetup は変更なし) ...
+// (bmisetup は変更なし)
 void bmisetup(){
-  // (元のコードと全く同じ)
-  Wire.setClock(400000); // I2Cクロックを400kHzに設定
+  Wire.setClock(400000); 
   Serial.println("Initializing Accelerometer...");
-  writeRegister(ACC_ADDRESS, ACC_SOFTRESET, 0xB6);
-  delay(100);
-  writeRegister(ACC_ADDRESS, ACC_PWR_CTRL, 0x04);
-  delay(50);
-  writeRegister(ACC_ADDRESS, ACC_RANGE, 0x02); // ±12g
+  writeRegister(ACC_ADDRESS, ACC_SOFTRESET, 0xB6); delay(100);
+  writeRegister(ACC_ADDRESS, ACC_PWR_CTRL, 0x04); delay(50);
+  writeRegister(ACC_ADDRESS, ACC_RANGE, 0x02); 
   writeRegister(ACC_ADDRESS, ACC_CONF, 0xA8); // ODR=100Hz
-  writeRegister(ACC_ADDRESS, ACC_PWR_CONF, 0x00);
-  delay(10);
+  writeRegister(ACC_ADDRESS, ACC_PWR_CONF, 0x00); delay(10);
   Serial.println("Accelerometer Initialized.");
   Serial.println("Initializing Gyroscope...");
-  writeRegister(GYRO_ADDRESS, GYRO_SOFTRESET, 0xB6);
-  delay(100);
-  writeRegister(GYRO_ADDRESS, GYRO_RANGE, 0x00); // ±2000dps
+  writeRegister(GYRO_ADDRESS, GYRO_SOFTRESET, 0xB6); delay(100);
+  writeRegister(GYRO_ADDRESS, GYRO_RANGE, 0x00); 
   writeRegister(GYRO_ADDRESS, GYRO_BANDWIDTH, 0x88); // ODR=100Hz
-  writeRegister(GYRO_ADDRESS, GYRO_LPM1, 0x00);
-  delay(50);
+  writeRegister(GYRO_ADDRESS, GYRO_LPM1, 0x00); delay(50);
   Serial.println("Gyroscope Initialized.");
-  Serial.println("----------------------------------------");
 }
 
-// ★修正: bmieget はローカル変数に読み込む
-SensorData bmieget_local(){
-  uint8_t buffer[6];
-  SensorData localData; // ローカルの構造体
-
-  //---- Read Accelerometer Data ----
-  readRegisters(ACC_ADDRESS, ACC_DATA_START, buffer, 6);
-  int16_t raw_ax = (int16_t)((buffer[1] << 8) | buffer[0]);
-  int16_t raw_ay = (int16_t)((buffer[3] << 8) | buffer[2]);
-  int16_t raw_az = (int16_t)((buffer[5] << 8) | buffer[4]);
-  localData.ax = raw_ax * ACC_SCALE * G_TO_MS2;
-  localData.ay = raw_ay * ACC_SCALE * G_TO_MS2;
-  localData.az = raw_az * ACC_SCALE * G_TO_MS2;
-
-  //---- Read Gyroscope Data ----
-  readRegisters(GYRO_ADDRESS, GYRO_DATA_START, buffer, 6);
-  int16_t raw_gx = (int16_t)((buffer[1] << 8) | buffer[0]);
-  int16_t raw_gy = (int16_t)((buffer[3] << 8) | buffer[2]);
-  int16_t raw_gz = (int16_t)((buffer[5] << 8) | buffer[4]);
-  localData.gx = raw_gx * GYRO_SCALE;
-  localData.gy = raw_gy * GYRO_SCALE;
-  localData.gz = raw_gz * GYRO_SCALE;
-
-  return localData;
-}
-
-// ... (qmcsetup は変更なし) ...
+// (qmcsetup は変更なし)
 void qmcsetup(){
     compass.init();
     Serial.println("QMC initialized");
 }
 
-// ★修正: qmcget は引数のポインタに書き込む
-void qmcget_local(int* p_cx, int* p_cy, int* p_cz){
+
+//================================================================
+// ★ Task A (Core 0, Prio 2): センサー読み取り & キュー送信
+//================================================================
+void sensorTask(void *pvParameters) {
+  Serial.println("Sensor Task started on Core 0 (Prio 2)");
+  
+  // このタスク専用の構造体インスタンス
+  LogEntry entry; 
+  uint8_t buffer[6]; // BMI読み取り用
+
+  // --- 正確な5ms周期タイマーのセットアップ ---
+  const TickType_t xFrequency = pdMS_TO_TICKS(5); // 5msをTickに変換
+  TickType_t xLastWakeTime = xTaskGetTickCount(); // 現在時刻を取得
+
+  for (;;) {
+    // --- 5ms周期で正確に待機 ---
+    // (次の 5ms の倍数の時刻までスリープする)
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    // --- 処理開始 (ここが5msごとに実行される) ---
+    entry.timestamp = millis();
+
+    // GPS (非常に高速)
+    while (ss.available() > 0) {
+        gps.encode(ss.read());
+    }
+
+    // BME
+    entry.temp = bme.readTemperature();
+    entry.pres = bme.readPressure() / 100.0F;
+    entry.alt = bme.readAltitude(SEALEVELPRESSURE_HPA);
+    entry.hum = bme.readHumidity();
+
+    // BMI (Acc)
+    readRegisters(ACC_ADDRESS, ACC_DATA_START, buffer, 6);
+    entry.ax = (int16_t)((buffer[1] << 8) | buffer[0]) * ACC_SCALE * G_TO_MS2;
+    entry.ay = (int16_t)((buffer[3] << 8) | buffer[2]) * ACC_SCALE * G_TO_MS2;
+    entry.az = (int16_t)((buffer[5] << 8) | buffer[4]) * ACC_SCALE * G_TO_MS2;
+    
+    // BMI (Gyro)
+    readRegisters(GYRO_ADDRESS, GYRO_DATA_START, buffer, 6);
+    entry.gx = (int16_t)((buffer[1] << 8) | buffer[0]) * GYRO_SCALE;
+    entry.gy = (int16_t)((buffer[3] << 8) | buffer[2]) * GYRO_SCALE;
+    entry.gz = (int16_t)((buffer[5] << 8) | buffer[4]) * GYRO_SCALE;
+
+    // QMC
     compass.read();
-    *p_cx = compass.getX();
-    *p_cy = compass.getY();
-    *p_cz = compass.getZ();
+    entry.cx = compass.getX();
+    entry.cy = compass.getY();
+    entry.cz = compass.getZ();
+
+    // GPS (GPSは1秒に1回しか更新されないが、常に最新の値を記録)
+    entry.lat = gps.location.isValid() ? (int32_t)(gps.location.lat() * 1e6) : 0;
+    entry.lng = gps.location.isValid() ? (int32_t)(gps.location.lng() * 1e6) : 0;
+    entry.gps_alt = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+    entry.sats = gps.satellites.isValid() ? (uint8_t)gps.satellites.value() : 0;
+    
+    if (gps.date.isValid()) {
+      entry.date_year = gps.date.year();
+      entry.date_month = gps.date.month();
+      entry.date_day = gps.date.day();
+    }
+    if (gps.time.isValid()) {
+      entry.time_hour = gps.time.hour();
+      entry.time_min = gps.time.minute();
+      entry.time_sec = gps.time.second();
+      entry.time_cs = gps.time.centisecond();
+    }
+
+    // --- データをキューに送信 ---
+    // (キューが一杯の場合、1msだけ待つ。待てない場合は諦めて次のループへ)
+    xQueueSend(xQueue, &entry, pdMS_TO_TICKS(1));
+  }
 }
 
-
 //================================================================
-// ★★★ Core 0 で実行されるセンサー読み取り専門タスク ★★★
+// ★ Task B (Core 1, Prio 1): SDカードへのバイナリ書き込み
 //================================================================
-void sensorReadTask(void *pvParameters) {
-  Serial.println("Sensor Read Task started on Core 0.");
+void sdWriteTask(void *pvParameters) {
+  Serial.println("SD Write Task started on Core 1 (Prio 1)");
+  LogEntry receivedEntry;
 
-  // センサー読み取り用のローカル変数
-  SensorData localBmi;
-  float localTemp, localPres, localAlt, localHum;
-  int localCx, localCy, localCz;
-
-  // 無限ループ
   for (;;) {
-    
-    // --- 1. I2Cセンサーからデータを読み取る ---
-    // (この処理はロックの外で行う)
-    localBmi = bmieget_local();
-    qmcget_local(&localCx, &localCy, &localCz);
-    localTemp = bme.readTemperature();
-    localPres = bme.readPressure() / 100.0F;
-    localAlt = bme.readAltitude(SEALEVELPRESSURE_HPA);
-    localHum = bme.readHumidity();
-
-    // --- 2. データをロックして共有メモリにコピー ---
-    // (portMAX_DELAY = ロックが取れるまで無限に待つ)
-    if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    // --- キューにデータが来るまで無限に待機 (スリープ) ---
+    if (xQueueReceive(xQueue, &receivedEntry, portMAX_DELAY) == pdPASS) {
       
-      // グローバル共有変数に一括コピー
-      g_sharedData.bmi = localBmi;
-      g_sharedData.temp = localTemp;
-      g_sharedData.pres = localPres;
-      g_sharedData.alt = localAlt;
-      g_sharedData.hum = localHum;
-      g_sharedData.cx = localCx;
-      g_sharedData.cy = localCy;
-      g_sharedData.cz = localCz;
-
-      // ロックを解除
-      xSemaphoreGive(dataMutex);
+      // --- データを受信したら、SDバッファにバイナリを書き込む ---
+      if (dataFile) {
+        // これが最速の書き込み方法
+        dataFile.write((const uint8_t*)&receivedEntry, sizeof(LogEntry));
+      } else {
+        digitalWrite(error_ledpin, HIGH);
+      }
+      
+      // GPSが受信できていたらSTATLEDが点灯 (ここで制御)
+      if (receivedEntry.sats > 0){
+          digitalWrite(stat_ledpin, HIGH);
+      } else {
+          digitalWrite(stat_ledpin, LOW);
+      }
     }
+  }
+}
+
+//================================================================
+// ★ Task C (Core 1, Prio 0): SDカードのフラッシュ (低優先度)
+//================================================================
+void sdFlushTask(void *pvParameters) {
+  Serial.println("SD Flush Task started on Core 1 (Prio 0)");
+  for (;;) {
+    // --- 1秒待機 ---
+    vTaskDelay(pdMS_TO_TICKS(1000)); 
     
-    // --- 3. 少し待つ ---
-    // (CPUを100%使い切らないよう、OSに処理を返す)
-    // 1ms待機。センサーのODR (100Hz=10ms) に合わせて調整可能
-    vTaskDelay(pdMS_TO_TICKS(1)); 
+    // --- 1秒に1回、物理書き込みを実行 ---
+    if (dataFile) {
+      dataFile.flush();
+      // Serial.println("Flashed to SD."); // デバッグ用
+    }
   }
 }
 
 
 //================================================================
-// ★★★ Core 1 で実行されるメインの setup ★★★
+// ★★★ メインの setup (Core 1) ★★★
 //================================================================
 void setup() {
     pinMode(error_ledpin, OUTPUT ); 
     pinMode(stat_ledpin, OUTPUT );  
+    digitalWrite(error_ledpin, LOW);
+    digitalWrite(stat_ledpin, LOW);
 
     Serial.begin(115200);
-    Serial.println("\nDual-Core High-Speed Data Logger");
+    Serial.println("\nBinary High-Speed Data Logger");
 
     spi.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN, SD_CS_PIN);
     
-    // ★重要: Core 0 タスクより先にI2Cを初期化
     Wire.begin(I2C_SDA, I2C_SCL);
     bool status = bme.begin(0x76); 
     bmisetup();
@@ -289,182 +340,68 @@ void setup() {
     }
     Serial.println("SD card initialized.");
 
+    // ★バイナリファイルとして開く (FILE_WRITE)
     dataFile = SD.open(fileName, FILE_WRITE);
-    if (dataFile) {
-        dataFile.println("Date,Time_cs,millis,Lat,Lng,Sat,Alt,Temp,Pres,PrAl,Humi,ax,ay,az,gx,gy,gz,cx,cy,cz");
-        Serial.print("Header written to ");
-        Serial.println(fileName);
-    } else {
+    if (!dataFile) {
         Serial.print("Error opening ");
         digitalWrite(error_ledpin, HIGH);
         Serial.println(fileName);
         while (1); 
     }
-    Serial.println();
+    Serial.print("Binary file opened: ");
+    Serial.println(fileName);
+    Serial.print("LogEntry struct size: ");
+    Serial.println(sizeof(LogEntry)); // 構造体のサイズを確認
 
-    // ★★★ デュアルコア処理の開始 ★★★
-    
-    // 1. ミューテックス（ロック機構）を作成
-    dataMutex = xSemaphoreCreateMutex();
-    if (dataMutex == NULL) {
-      Serial.println("Mutex creation failed!");
+    // ★★★ タスクとキューの作成 ★★★
+
+    // 1. キューを作成 ( LogEntry構造体を QUEUE_LENGTH 個格納できる )
+    xQueue = xQueueCreate(QUEUE_LENGTH, sizeof(LogEntry));
+    if (xQueue == NULL) {
+      Serial.println("Queue creation failed!");
       while(1);
     }
 
-    // 2. センサー読み取りタスクを Core 0 に割り当てて開始
+    // 2. SD書き込みタスク (Core 1, Prio 1)
     xTaskCreatePinnedToCore(
-        sensorReadTask,   // 実行する関数
-        "SensorTask",     // タスク名
-        4096,             // スタックサイズ (bytes)
-        NULL,             // タスク引数
-        1,                // 優先度 (0=低, 1=中, ...)
-        &hSensorTask,     // タスクハンドル
-        0                 // 実行コア (0 = Core 0)
+        sdWriteTask,   
+        "SDWriteTask", 
+        4096,          
+        NULL,          
+        1,             // 優先度
+        &hSdWriteTask, 
+        1              // Core 1
     );
+
+    // 3. SDフラッシュタスク (Core 1, Prio 0 - 最低)
+    xTaskCreatePinnedToCore(
+        sdFlushTask,   
+        "SDFlushTask", 
+        2048,          
+        NULL,          
+        0,             // 優先度
+        &hSdFlushTask, 
+        1              // Core 1
+    );
+
+    // 4. センサー読み取りタスク (Core 0, Prio 2 - 最高)
+    xTaskCreatePinnedToCore(
+        sensorTask,    
+        "SensorTask",  
+        4096,          
+        NULL,          
+        2,             // 優先度
+        &hSensorTask,  
+        0              // Core 0
+    );
+
+    // Arduinoのloopタスクはもう不要なので削除
+    vTaskDelete(NULL); 
 }
 
 //================================================================
-// ★★★ Core 1 で実行されるメインの loop (ロギング担当) ★★★
+// ★★★ loop() はもう使われません ★★★
 //================================================================
 void loop() {
-    // --- GPS処理 (Core 1 で実行) ---
-    while (ss.available() > 0) {
-        gps.encode(ss.read());
-    }
-    if (gps.location.isUpdated()){
-        digitalWrite(stat_ledpin, HIGH);
-    } else {
-        digitalWrite(stat_ledpin, LOW);
-    }
-
-    unsigned long currentMillis = millis();
-
-    // --- メインの高速ロギングタイマー (Core 1) ---
-    if (currentMillis - lastLogTime >= logInterval) {
-        lastLogTime = currentMillis;
-
-        char logBuffer[512]; 
-        char tempBuffer[50]; 
-        
-        // --- 1. 共有メモリからデータを安全にコピーする ---
-        // (このブロックは素早く抜ける)
-        SharedSensorData localData; // ログ整形用のローカルコピー
-        
-        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) { // 1msだけ待つ
-          // 共有データをローカルにコピー
-          localData = g_sharedData;
-          // ロックを解除
-          xSemaphoreGive(dataMutex);
-        } else {
-          // 1ms待ってもロックが取れない = 異常
-          Serial.println("Log task could not get mutex!");
-          // (エラー時のデータをどうするか？ とりあえず古いデータでログる)
-        }
-
-        // --- 2. センサー読み取り以外の処理 (文字列フォーマット) ---
-        // (ロックの外で、時間をかけて実行する)
-
-        // --- GPS Date ---
-        if (gps.date.isValid()) {
-            snprintf(tempBuffer, sizeof(tempBuffer), "%04d-%02d-%02d", gps.date.year(), gps.date.month(), gps.date.day());
-        } else {
-            strcpy(tempBuffer, "N/A");
-        }
-        strcpy(logBuffer, tempBuffer); 
-        strcat(logBuffer, ","); 
-
-        // --- GPS Time ---
-        if (gps.time.isValid()) {
-            snprintf(tempBuffer, sizeof(tempBuffer), "%02d:%02d:%02d.%02d", 
-                     gps.time.hour(), gps.time.minute(), gps.time.second(), gps.time.centisecond());
-        } else {
-            strcpy(tempBuffer, "N/A");
-        }
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-
-        // --- Millis ---
-        ltoa(currentMillis, tempBuffer, 10);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-
-        // --- GPS Location ---
-        dtostrf(gps.location.isValid() ? gps.location.lat() : 0.0, 4, 6, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        dtostrf(gps.location.isValid() ? gps.location.lng() : 0.0, 4, 6, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-
-        // --- GPS Satellites & Altitude ---
-        ltoa(gps.satellites.isValid() ? gps.satellites.value() : 0, tempBuffer, 10);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        dtostrf(gps.altitude.isValid() ? gps.altitude.meters() : 0.0, 4, 2, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-
-        // --- BME (コピー済みのローカルデータから) ---
-        dtostrf(localData.temp, 4, 2, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        dtostrf(localData.pres, 4, 2, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        dtostrf(localData.alt, 4, 2, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        dtostrf(localData.hum, 4, 2, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-
-        // --- BMI (コピー済みのローカルデータから) ---
-        dtostrf(localData.bmi.ax, 4, 4, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        dtostrf(localData.bmi.ay, 4, 4, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        dtostrf(localData.bmi.az, 4, 4, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        dtostrf(localData.bmi.gx, 4, 4, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        dtostrf(localData.bmi.gy, 4, 4, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        dtostrf(localData.bmi.gz, 4, 4, tempBuffer);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-
-        // --- QMC (コピー済みのローカルデータから) ---
-        ltoa(localData.cx, tempBuffer, 10);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        ltoa(localData.cy, tempBuffer, 10);
-        strcat(logBuffer, tempBuffer);
-        strcat(logBuffer, ",");
-        ltoa(localData.cz, tempBuffer, 10);
-        strcat(logBuffer, tempBuffer);
-
-        // --- 3. SDバッファへの書き込み ---
-        if (dataFile) {
-            dataFile.println(logBuffer);
-        } else {
-            Serial.println("SD card file handle lost!");
-            digitalWrite(error_ledpin, HIGH);
-        }
-    }
-
-    // --- SDカードへの物理書き込みタイマー (Core 1) ---
-    if (currentMillis - lastFlushTime >= flushInterval) {
-        lastFlushTime = currentMillis;
-        if (dataFile) {
-            dataFile.flush(); 
-        } else {
-            Serial.println("SD card file handle lost! Cannot flush.");
-            digitalWrite(error_ledpin, HIGH);
-        }
-    }
+  // vTaskDelete(NULL) で削除されたため、ここには到達しない
 }
