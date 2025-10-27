@@ -9,17 +9,10 @@ Original file is located at
 
 import struct
 import csv
+import os # ファイル操作のために追加
 
-# ESP32の「struct LogEntry」と全く同じ構造をPythonで定義
-# ==========================================================
-# < は リトルエンディアン (ESP32と同じ)
-# I = uint32_t (4 bytes)
-# f = float (4 bytes)
-# h = int16_t (2 bytes)
-# i = int32_t (4 bytes)
-# B = uint8_t (1 byte)
-# H = uint16_t (2 bytes)
-LOG_FORMAT = '<I ffff fff fff hhh iifB HBB BBB B'
+# ESP32の「struct LogEntry」と全く同じ構造
+LOG_FORMAT = '<I ffff fff fff hhh iifB HBB BBB B B'
 LOG_SIZE = struct.calcsize(LOG_FORMAT)
 
 # CSVのヘッダー
@@ -31,47 +24,90 @@ CSV_HEADER = [
     'cx', 'cy', 'cz',
     'lat_deg', 'lng_deg', 'gps_alt_m', 'sats',
     'year', 'month', 'day',
-    'hour', 'min', 'sec', 'cs'
+    'hour', 'min', 'sec', 'cs',
+    'gps_updated'
 ]
 
 IN_FILE = 'fulldata.bin'
-OUT_FILE = 'converted_log.csv'
+# 出力ファイル名は連番にするので、ベース名だけ定義
+OUT_FILE_BASE = 'converted_log'
 
-def convert_to_csv(bin_file, csv_file):
+# ★★★ 追加: ファイル分割設定 ★★★
+SPLIT_INTERVAL_MS = 5 * 60 * 1000 # 5分 (ミリ秒)
+# ★★★★★★★★★★★★★★★★★
+
+
+def convert_and_split_csv(bin_file, out_base):
     print(f"Struct size: {LOG_SIZE} bytes")
     print(f"Opening binary file: {bin_file}")
+    print(f"Splitting CSV every {SPLIT_INTERVAL_MS} ms")
 
     try:
-        with open(bin_file, 'rb') as f_in, open(csv_file, 'w', newline='') as f_out:
+        with open(bin_file, 'rb') as f_in:
 
-            writer = csv.writer(f_out)
-            writer.writerow(CSV_HEADER)
+            # --- 変数を初期化 ---
+            f_out = None       # 現在の出力ファイルオブジェクト
+            writer = None      # 現在のCSVライター
+            file_index = 0     # ファイル番号 (001から始める)
+            start_timestamp = 0 # 現在のファイルの最初のタイムスタンプ
+            first_entry = True # 最初のデータかどうか
 
-            count = 0
+            count_total = 0
+            count_current_file = 0
+
             while True:
-                # 1エントリ分 (LOG_SIZE) のバイナリデータを読み込む
                 chunk = f_in.read(LOG_SIZE)
                 if not chunk or len(chunk) < LOG_SIZE:
                     break # ファイルの終わり
 
-                # データをPythonのタプルにアンパック（展開）
                 try:
                     data = struct.unpack(LOG_FORMAT, chunk)
                 except struct.error as e:
-                    print(f"Unpack error at entry {count}: {e}. File might be corrupt.")
+                    print(f"Unpack error at entry {count_total}: {e}. File might be corrupt.")
                     break
 
-                # GPSの緯度経度を float に戻す (1e6 で割る)
-                # data[14] = lat, data[15] = lng
+                current_timestamp = data[0]
+
+                # --- 新しいファイルを開く必要があるかチェック ---
+                # 1. 最初のデータの場合
+                # 2. または、現在のタイムスタンプが分割時間を超えた場合
+                if first_entry or (current_timestamp >= start_timestamp + SPLIT_INTERVAL_MS):
+
+                    # 既にファイルが開いていれば閉じる
+                    if f_out:
+                        f_out.close()
+                        print(f"  -> File {file_index} closed ({count_current_file} entries).")
+
+                    # 新しいファイルを開く
+                    file_index += 1
+                    out_file_name = f"{out_base}_{file_index:03d}.csv" # 例: converted_log_001.csv
+                    print(f"Opening new output file: {out_file_name}")
+                    f_out = open(out_file_name, 'w', newline='')
+                    writer = csv.writer(f_out)
+                    writer.writerow(CSV_HEADER) # ヘッダーを書き込み
+
+                    # 最初のタイムスタンプを更新
+                    start_timestamp = current_timestamp
+                    first_entry = False
+                    count_current_file = 0
+
+
+                # --- データを処理して書き込む ---
+                # GPSの緯度経度を float に戻す
                 csv_row = list(data)
                 csv_row[14] = data[14] / 1e6 # lat
                 csv_row[15] = data[15] / 1e6 # lng
 
                 writer.writerow(csv_row)
-                count += 1
+                count_total += 1
+                count_current_file += 1
 
-            print(f"Successfully converted {count} log entries.")
-            print(f"Output saved to: {OUT_FILE}")
+            # --- 最後のファイルを閉じる ---
+            if f_out:
+                f_out.close()
+                print(f"  -> File {file_index} closed ({count_current_file} entries).")
+
+            print(f"\nSuccessfully converted {count_total} log entries into {file_index} file(s).")
 
     except FileNotFoundError:
         print(f"Error: Input file '{bin_file}' not found.")
@@ -79,4 +115,4 @@ def convert_to_csv(bin_file, csv_file):
         print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
-    convert_to_csv(IN_FILE, OUT_FILE)
+    convert_and_split_csv(IN_FILE, OUT_FILE_BASE)
