@@ -35,7 +35,7 @@ File dataFile;
 // ===============
 
 // ===== BME (Core 0) =====
-#define SEALEVELPRESSURE_HPA (1011.4)
+#define SEALEVELPRESSURE_HPA (1027.949818)
 #define I2C_SDA 17
 #define I2C_SCL 16
 
