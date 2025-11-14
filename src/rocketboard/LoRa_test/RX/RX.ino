@@ -1,9 +1,7 @@
 #include <Arduino.h>
-// 送信（RX)
+// 受信（TX)
 // Mbedコアでは Serial1 (GP0, GP1) を使用します
 HardwareSerial& LoRaSerial = Serial1;
-
-int counter = 0;
 
 void setup() {
   // PCとの通信用 (シリアルモニタ)
@@ -11,27 +9,28 @@ void setup() {
   while (!Serial);
 
   // LoRaモジュール (E220) との通信用
-  // E220のデフォルトボーレート 9600bps
+  // ボーレートは送信側と合わせる (デフォルト9600)
   LoRaSerial.begin(115200);
   
   pinMode(LED_BUILTIN, OUTPUT);
-  Serial.println("E220 Transmitter (Pico Mbed Core - Serial1)");
+  Serial.println("E220 Receiver (Pico Mbed Core - Serial1)");
 }
 
 void loop() {
-  // 送信するメッセージを作成
-  String message = "Hello LoRa! Count: " + String(counter) + "\n";
-  
-  // LoRaモジュールにメッセージを送信
-  LoRaSerial.print(message);
-  
-  Serial.print("Sent: ");
-  Serial.print(message); 
+  // LoRaモジュールからデータが届いているか確認
+  if (LoRaSerial.available() > 0) {
+    // データを受信し、文字列として読み込む (改行まで)
+    String message = LoRaSerial.readStringUntil('\n');
+    message.trim(); // 前後の空白や改行コードを削除
 
-  digitalWrite(LED_BUILTIN, HIGH);
-  delay(100);
-  digitalWrite(LED_BUILTIN, LOW);
-
-  counter++;
-  delay(5000); // 5秒待機
+    if (message.length() > 0) {
+      // シリアルモニタに表示
+      Serial.print("Received: ");
+      Serial.println(message);
+      
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(200);
+      digitalWrite(LED_BUILTIN, LOW);
+    }
+  }
 }
