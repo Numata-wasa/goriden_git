@@ -1,83 +1,77 @@
 /*
- * Rocket Telemetry Dummy Generator for TWELITE
- * Board: Raspberry Pi Pico
- * Interface: Serial2 (UART1)
- * Pins: TX = GP4, RX = GP5
- * Baud Rate: 115200
+ * 送信側 Pico (Tx) : ASCIIコマンド送信対応版
+ * TWELITE設定: m=A, i=1
  */
 
-// ピン定義
-const int TX_PIN = 4;
-const int RX_PIN = 5;
-
-// 送信間隔 (ms) - Python側のtime.sleep(0.1)に合わせる
-const int INTERVAL_MS = 100;
-
-unsigned long previousMillis = 0;
+unsigned long lastTime = 0;
+// ダミーデータ
+float dummyLat = 35.6895;
+float dummyLon = 139.6917;
+float dummyPress = 1013.25;
 
 void setup() {
+  Serial2.setTX(4);
+  Serial2.setRX(5);
+  Serial2.begin(115200); // TWELITEとの通信 (Baudrate確認!)
+  Serial.begin(115200);  // PCデバッグ用
   pinMode(14, OUTPUT);
-  // USBシリアル (デバッグ用)
-  Serial.begin(115200);
-
-  // TWELITE用シリアル (Serial2を使用)
-  // Earle Philhower版コアではsetTX/setRXでピンを割り当て可能
-  Serial2.setTX(TX_PIN);
-  Serial2.setRX(RX_PIN);
-  Serial2.begin(115200); // Python側のBAUD_RATEに合わせる
-
-  // 乱数の初期化 (未接続のアナログピンのノイズをシードにする)
-  randomSeed(analogRead(26));
   digitalWrite(14, HIGH);
 }
 
+/* * TWELITEにデータを送るための関数
+ * アスキー形式 (:7800[Payload][Checksum]) を生成して送信します
+ */
+void sendTweliteData(String msg) {
+  // 1. コマンドと宛先
+  // 0x78: 任意の相手に送るコマンド
+  // 0x00: 宛先ID (親機 = 0)
+  String cmd = "7800"; 
+
+  // 2. データ部分をHEX文字列に変換
+  // 例: "ABC" -> "414243"
+  for (int i = 0; i < msg.length(); i++) {
+    char c = msg.charAt(i);
+    // 1桁のHEXの場合、頭に0をつける (例: A -> 0A)
+    if (c < 16) cmd += "0";
+    cmd += String(c, HEX);
+  }
+
+  // 3. チェックサム計算 (TWELITE仕様)
+  // 全バイトを足して、2の補数をとる
+  unsigned long sum = 0;
+  for (int i = 0; i < cmd.length(); i += 2) {
+    String byteStr = cmd.substring(i, i + 2);
+    sum += strtoul(byteStr.c_str(), NULL, 16);
+  }
+  
+  unsigned char checksum = (unsigned char)((~sum + 1) & 0xFF);
+  String checksumStr = String(checksum, HEX);
+  if (checksumStr.length() < 2) checksumStr = "0" + checksumStr; // ゼロ埋め
+  
+  // 4. 全部つなげて送信 (: + コマンド + チェックサム + 改行)
+  cmd.toUpperCase();
+  checksumStr.toUpperCase();
+  String packet = ":" + cmd + checksumStr;
+  
+  Serial2.print(packet + "\r\n"); // ★最後に必ず改行コードを送る
+  
+  // デバッグ表示
+  Serial.println("Sent: " + packet);
+}
+
 void loop() {
-  unsigned long currentMillis = millis();
+  if (millis() - lastTime > 200) { // 200ms間隔
+    lastTime = millis();
 
-  if (currentMillis - previousMillis >= INTERVAL_MS) {
-    previousMillis = currentMillis;
+    // データの更新
+    dummyLat += (random(-10, 11) * 0.0001);
+    dummyLon += (random(-10, 11) * 0.0001);
+    dummyPress += (random(-10, 11) * 0.1);
 
-    // --- ダミーデータの生成 (Pythonコードの挙動を模倣) ---
-    int time = millis();
-    // 1. GPS (東京周辺)
-    // random(min, max) は整数を返すため、100000倍して割ることで小数を生成
-    float lat = 35.6895 + (random(-100, 100) / 100000.0);
-    float lon = 139.6917 + (random(-100, 100) / 100000.0);
+    // 送信データの作成
+    String payload = String(millis()) + "," + String(dummyLat, 6) + "," + String(dummyLon, 6) + "," + String(dummyPress, 2);
 
-    // 2. 環境データ (気圧、温度)
-    // 気圧は少しずつ変化させる（上昇している風に）
-    float press = 1013.25 - (random(0, 5000) / 100.0); 
-    float temp = 25.0 + (random(-100, 100) / 100.0);
-
-    // 3. 9軸センサ (加速度, ジャイロ, 地磁気)
-    float ax = random(-200, 200) / 100.0;
-    float ay = random(-200, 200) / 100.0;
-    float az = random(-200, 200) / 100.0;
-
-    float gx = random(-10000, 10000) / 100.0;
-    float gy = random(-10000, 10000) / 100.0;
-    float gz = random(-10000, 10000) / 100.0;
-
-    float mx = random(-5000, 5000) / 100.0;
-    float my = random(-5000, 5000) / 100.0;
-    float mz = random(-5000, 5000) / 100.0;
-
-    // --- CSVデータの作成 ---
-    // フォーマット: lat,lon,press,temp,ax,ay,az,gx,gy,gz,mx,my,mz
-    String dataString = "";
-    dataString += String(time) + ",";
-    dataString += String(lat, 6) + ",";
-    dataString += String(lon, 6) + ",";
-    dataString += String(press, 2) + ",";
-    dataString += String(temp, 2) + ",";
-    dataString += String(ax, 2) + "," + String(ay, 2) + "," + String(az, 2) + ",";
-    dataString += String(gx, 2) + "," + String(gy, 2) + "," + String(gz, 2) + ",";
-    dataString += String(mx, 2) + "," + String(my, 2) + "," + String(mz, 2);
-    
-    // 改行コードを追加して送信
-    Serial2.println(dataString);
-    
-    // デバッグ用にUSBシリアルにも同じ内容を表示
-    Serial.println("Sent: " + dataString);
+    // コマンド生成関数を使って送信
+    sendTweliteData(payload);
   }
 }
