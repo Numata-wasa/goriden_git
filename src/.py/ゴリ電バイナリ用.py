@@ -9,10 +9,24 @@ Original file is located at
 
 import struct
 import csv
+<<<<<<< HEAD
+
+# ESP32の「struct LogEntry」と全く同じ構造をPythonで定義
+# ==========================================================
+# < は リトルエンディアン (ESP32と同じ)
+# I = uint32_t (4 bytes)
+# f = float (4 bytes)
+# h = int16_t (2 bytes)
+# i = int32_t (4 bytes)
+# B = uint8_t (1 byte)
+# H = uint16_t (2 bytes)
+LOG_FORMAT = '<I ffff fff fff hhh iifB HBB BBB B'
+=======
 import os # ファイル操作のために追加
 
 # ESP32の「struct LogEntry」と全く同じ構造
 LOG_FORMAT = '<I ffff fff fff hhh iifB HBB BBB B B'
+>>>>>>> test
 LOG_SIZE = struct.calcsize(LOG_FORMAT)
 
 # CSVのヘッダー
@@ -24,6 +38,27 @@ CSV_HEADER = [
     'cx', 'cy', 'cz',
     'lat_deg', 'lng_deg', 'gps_alt_m', 'sats',
     'year', 'month', 'day',
+<<<<<<< HEAD
+    'hour', 'min', 'sec', 'cs'
+]
+
+IN_FILE = 'fulldata.bin'
+OUT_FILE = 'converted_log.csv'
+
+def convert_to_csv(bin_file, csv_file):
+    print(f"Struct size: {LOG_SIZE} bytes")
+    print(f"Opening binary file: {bin_file}")
+
+    try:
+        with open(bin_file, 'rb') as f_in, open(csv_file, 'w', newline='') as f_out:
+
+            writer = csv.writer(f_out)
+            writer.writerow(CSV_HEADER)
+
+            count = 0
+            while True:
+                # 1エントリ分 (LOG_SIZE) のバイナリデータを読み込む
+=======
     'hour', 'min', 'sec', 'cs',
     'gps_updated'
 ]
@@ -56,10 +91,22 @@ def convert_and_split_csv(bin_file, out_base):
             count_current_file = 0
 
             while True:
+>>>>>>> test
                 chunk = f_in.read(LOG_SIZE)
                 if not chunk or len(chunk) < LOG_SIZE:
                     break # ファイルの終わり
 
+<<<<<<< HEAD
+                # データをPythonのタプルにアンパック（展開）
+                try:
+                    data = struct.unpack(LOG_FORMAT, chunk)
+                except struct.error as e:
+                    print(f"Unpack error at entry {count}: {e}. File might be corrupt.")
+                    break
+
+                # GPSの緯度経度を float に戻す (1e6 で割る)
+                # data[14] = lat, data[15] = lng
+=======
                 try:
                     data = struct.unpack(LOG_FORMAT, chunk)
                 except struct.error as e:
@@ -94,11 +141,18 @@ def convert_and_split_csv(bin_file, out_base):
 
                 # --- データを処理して書き込む ---
                 # GPSの緯度経度を float に戻す
+>>>>>>> test
                 csv_row = list(data)
                 csv_row[14] = data[14] / 1e6 # lat
                 csv_row[15] = data[15] / 1e6 # lng
 
                 writer.writerow(csv_row)
+<<<<<<< HEAD
+                count += 1
+
+            print(f"Successfully converted {count} log entries.")
+            print(f"Output saved to: {OUT_FILE}")
+=======
                 count_total += 1
                 count_current_file += 1
 
@@ -108,6 +162,7 @@ def convert_and_split_csv(bin_file, out_base):
                 print(f"  -> File {file_index} closed ({count_current_file} entries).")
 
             print(f"\nSuccessfully converted {count_total} log entries into {file_index} file(s).")
+>>>>>>> test
 
     except FileNotFoundError:
         print(f"Error: Input file '{bin_file}' not found.")
@@ -115,4 +170,8 @@ def convert_and_split_csv(bin_file, out_base):
         print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
+<<<<<<< HEAD
+    convert_to_csv(IN_FILE, OUT_FILE)
+=======
     convert_and_split_csv(IN_FILE, OUT_FILE_BASE)
+>>>>>>> test

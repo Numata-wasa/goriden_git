@@ -35,7 +35,7 @@ File dataFile;
 // ===============
 
 // ===== BME (Core 0) =====
-#define SEALEVELPRESSURE_HPA (1011.4)
+#define SEALEVELPRESSURE_HPA (1027.949818)
 #define I2C_SDA 17
 #define I2C_SCL 16
 
@@ -104,7 +104,11 @@ QueueHandle_t xQueue;
 byte ledBlinkState = 0;
 unsigned long ledStateChangeTime = 0;
 const long blinkOnDuration = 50;  // 1回の点灯時間 (ミリ秒)
+<<<<<<< HEAD
 const long blinkOffDuration = 40; // 点滅と点滅の間の消灯時間 (ミリ秒)
+=======
+const long blinkOffDuration = 80; // 点滅と点滅の間の消灯時間 (ミリ秒)
+>>>>>>> e534b9f76f2790126b59f9e1c4b63c3fb516e4df
 
 
 // (I2Cヘルパー関数, bmisetup, qmcsetup は変更なし)
