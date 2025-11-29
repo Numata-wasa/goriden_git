@@ -104,7 +104,7 @@ QueueHandle_t xQueue;
 byte ledBlinkState = 0;
 unsigned long ledStateChangeTime = 0;
 const long blinkOnDuration = 50;  // 1回の点灯時間 (ミリ秒)
-const long blinkOffDuration = 30; // 点滅と点滅の間の消灯時間 (ミリ秒)
+const long blinkOffDuration = 40; // 点滅と点滅の間の消灯時間 (ミリ秒)
 
 
 // (I2Cヘルパー関数, bmisetup, qmcsetup は変更なし)
@@ -316,6 +316,7 @@ void setup() {
     xQueue = xQueueCreate(QUEUE_LENGTH, sizeof(LogEntry));
     if (xQueue == NULL) {
       Serial.println("Queue creation failed!");
+      digitalWrite(error_ledpin, HIGH);
       while(1);
     }
 
