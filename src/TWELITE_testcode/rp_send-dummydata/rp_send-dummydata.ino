@@ -19,5 +19,5 @@ void loop() {
   
   // デバッグ
   Serial.println("Tx: " + payload);
-  delay(500);
+  delay(100);
 }
