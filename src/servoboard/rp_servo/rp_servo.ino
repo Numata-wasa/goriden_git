@@ -88,17 +88,17 @@ void loop() {
 
   myServo1.write(90);
 
-  if (pal2 > 20) {
-    delay(500);
+  if (pal2 > 35) {
+    delay(1000);
     while(servot < 2){
-      myServo1.write(95);
-      delay(250);
-      myServo1.write(90);
-      delay(250);
       myServo1.write(85);
-      delay(250);
+      delay(200);
       myServo1.write(90);
-      delay(250);
+      delay(300);
+      myServo1.write(95);
+      delay(200);
+      myServo1.write(90);
+      delay(300);
 
 
       servot = servot + 1;
