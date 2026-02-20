@@ -107,6 +107,7 @@ TaskHandle_t hSensorTask;
 TaskHandle_t hSdWriteTask;
 TaskHandle_t hSdFlushTask;
 TaskHandle_t hEulerTask;
+TaskHandle_t hSerialPrintTask;
 QueueHandle_t xQueue;
 QueueHandle_t xIMUQueue;
 #define QUEUE_LENGTH 50
@@ -116,6 +117,10 @@ QueueHandle_t xIMUQueue;
 volatile float sharedRoll  = 0.0f;
 volatile float sharedPitch = 0.0f;
 volatile float sharedYaw   = 0.0f;
+
+// ★★★ シリアル表示用 最新エントリの共有コピー ★★★
+LogEntry latestEntry;
+portMUX_TYPE entryMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ★★★ LED点滅制御用 (グローバル変数) ★★★
 // 0:Idle, 1:Blink1-ON, 2:Blink1-OFF(間), 3:Blink2-ON
@@ -289,7 +294,44 @@ void sensorTask(void *pvParameters) {
     entry.pitch = sharedPitch;
     entry.yaw   = sharedYaw;
 
+    // --- シリアル表示タスク用に最新エントリをコピー ---
+    portENTER_CRITICAL(&entryMux);
+    latestEntry = entry;
+    portEXIT_CRITICAL(&entryMux);
+
     xQueueSend(xQueue, &entry, pdMS_TO_TICKS(1));
+  }
+}
+
+//================================================================
+// ★ Task E (Core 1, Prio 0): シリアルモニタへの定期出力
+//================================================================
+void serialPrintTask(void *pvParameters) {
+  Serial.println("Serial Print Task started on Core 1 (Prio 0)");
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(1000)); // 1秒間隔
+
+    LogEntry e;
+    portENTER_CRITICAL(&entryMux);
+    e = latestEntry;
+    portEXIT_CRITICAL(&entryMux);
+
+    Serial.printf("[%lu] T:%.1f P:%.1f A:%.1f H:%.1f "
+                  "Acc:%.2f,%.2f,%.2f Gyr:%.1f,%.1f,%.1f "
+                  "Mag:%d,%d,%d "
+                  "GPS:lat:%.6f,lng:%.6f,alt:%.1f,sat:%d "
+                  "Date:%d/%d/%d %d:%02d:%02d.%02d "
+                  "RPY:%.1f,%.1f,%.1f upd:%d\n",
+                  e.timestamp,
+                  e.temp, e.pres, e.alt, e.hum,
+                  e.ax, e.ay, e.az,
+                  e.gx, e.gy, e.gz,
+                  e.cx, e.cy, e.cz,
+                  e.lat / 1e6, e.lng / 1e6, e.gps_alt, e.sats,
+                  e.date_year, e.date_month, e.date_day,
+                  e.time_hour, e.time_min, e.time_sec, e.time_cs,
+                  e.roll, e.pitch, e.yaw,
+                  e.gps_updated);
   }
 }
 
@@ -413,10 +455,11 @@ void setup() {
       while(1);
     }
 
-    xTaskCreatePinnedToCore(sdWriteTask,  "SDWriteTask", 4096, NULL, 1, &hSdWriteTask, 1);
-    xTaskCreatePinnedToCore(sdFlushTask,  "SDFlushTask", 2048, NULL, 0, &hSdFlushTask, 1);
-    xTaskCreatePinnedToCore(eulerTask,    "EulerTask",   4096, NULL, 1, &hEulerTask,   0);
-    xTaskCreatePinnedToCore(sensorTask,   "SensorTask",  4096, NULL, 2, &hSensorTask,  0);
+    xTaskCreatePinnedToCore(sdWriteTask,     "SDWriteTask",    4096, NULL, 1, &hSdWriteTask,    1);
+    xTaskCreatePinnedToCore(sdFlushTask,     "SDFlushTask",    2048, NULL, 0, &hSdFlushTask,    1);
+    xTaskCreatePinnedToCore(serialPrintTask, "SerialPrint",    4096, NULL, 0, &hSerialPrintTask,1);
+    xTaskCreatePinnedToCore(eulerTask,       "EulerTask",      4096, NULL, 1, &hEulerTask,      0);
+    xTaskCreatePinnedToCore(sensorTask,      "SensorTask",     4096, NULL, 2, &hSensorTask,     0);
 }
 
 //================================================================
