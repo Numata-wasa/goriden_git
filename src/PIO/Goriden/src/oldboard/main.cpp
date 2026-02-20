@@ -14,8 +14,8 @@
 #include <QMC5883LCompass.h>
 
 //エラーランプ
-const int error_ledpin = 42;
-const int stat_ledpin = 41;
+const int error_ledpin = 41;
+const int stat_ledpin = 42;
 
 // ===== GPS (Core 0) =====
 static const int RXPin = 7, TXPin = 6;
@@ -88,8 +88,17 @@ struct LogEntry {
   uint8_t  date_month, date_day;
   uint8_t  time_hour, time_min, time_sec, time_cs;
   uint8_t  gps_updated; // GPS座標が更新されたかのフラグ
+  float roll, pitch, yaw; // オイラー角 (度)
 };
 #pragma pack(pop)
+
+// ★★★ オイラー角計算用 IMUデータ構造体 ★★★
+struct IMUData {
+  float ax, ay, az;
+  float gx, gy, gz;
+  int16_t cx, cy, cz;
+  uint32_t timestamp;
+};
 
 //================================================================
 // ★★★ FreeRTOS タスク設定 ★★★
@@ -97,8 +106,16 @@ struct LogEntry {
 TaskHandle_t hSensorTask;
 TaskHandle_t hSdWriteTask;
 TaskHandle_t hSdFlushTask;
+TaskHandle_t hEulerTask;
 QueueHandle_t xQueue;
+QueueHandle_t xIMUQueue;
 #define QUEUE_LENGTH 50
+#define IMU_QUEUE_LENGTH 10
+
+// ★★★ 共有オイラー角 (タスク間で参照) ★★★
+volatile float sharedRoll  = 0.0f;
+volatile float sharedPitch = 0.0f;
+volatile float sharedYaw   = 0.0f;
 
 // ★★★ LED点滅制御用 (グローバル変数) ★★★
 // 0:Idle, 1:Blink1-ON, 2:Blink1-OFF(間), 3:Blink2-ON
@@ -140,8 +157,63 @@ void qmcsetup(){
 
 
 //================================================================
+// ★ Task D (Core 0, Prio 1): オイラー角計算 (相補フィルタ)
+//================================================================
+void eulerTask(void *pvParameters) {
+  Serial.println("Euler Task started on Core 0 (Prio 1)");
+
+  float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
+  const float alpha = 0.98f;  // 相補フィルタ係数 (ジャイロ信頼度)
+  const float RAD_TO_DEG_F = 180.0f / PI;
+  const float DEG_TO_RAD_F = PI / 180.0f;
+  uint32_t lastTime = 0;
+  bool initialized = false;
+  IMUData imu;
+
+  for (;;) {
+    if (xQueueReceive(xIMUQueue, &imu, portMAX_DELAY) == pdPASS) {
+
+      // --- 加速度からロール・ピッチを算出 ---
+      float rollAcc  = atan2f(imu.ay, imu.az) * RAD_TO_DEG_F;
+      float pitchAcc = atan2f(-imu.ax, sqrtf(imu.ay * imu.ay + imu.az * imu.az)) * RAD_TO_DEG_F;
+
+      // --- チルト補正付き地磁気からヨーを算出 ---
+      float rRad = rollAcc * DEG_TO_RAD_F;
+      float pRad = pitchAcc * DEG_TO_RAD_F;
+      float magX = imu.cx * cosf(pRad) + imu.cz * sinf(pRad);
+      float magY = imu.cx * sinf(rRad) * sinf(pRad)
+                 + imu.cy * cosf(rRad)
+                 - imu.cz * sinf(rRad) * cosf(pRad);
+      float yawMag = atan2f(-magY, magX) * RAD_TO_DEG_F;
+
+      if (!initialized) {
+        // 初回: 加速度+地磁気の値で初期化
+        roll  = rollAcc;
+        pitch = pitchAcc;
+        yaw   = yawMag;
+        lastTime    = imu.timestamp;
+        initialized = true;
+      } else {
+        float dt = (imu.timestamp - lastTime) / 1000.0f; // 秒
+        lastTime = imu.timestamp;
+        if (dt <= 0.0f || dt > 0.5f) continue; // 異常な dt はスキップ
+
+        // 相補フィルタ: ジャイロ積分 + 加速度/地磁気補正
+        roll  = alpha * (roll  + imu.gx * dt) + (1.0f - alpha) * rollAcc;
+        pitch = alpha * (pitch + imu.gy * dt) + (1.0f - alpha) * pitchAcc;
+        yaw   = alpha * (yaw   + imu.gz * dt) + (1.0f - alpha) * yawMag;
+      }
+
+      // 共有変数に書き込み
+      sharedRoll  = roll;
+      sharedPitch = pitch;
+      sharedYaw   = yaw;
+    }
+  }
+}
+
+//================================================================
 // ★ Task A (Core 0, Prio 2): センサー初期化 & 読み取り
-// (変更なし)
 //================================================================
 void sensorTask(void *pvParameters) {
 
@@ -204,6 +276,19 @@ void sensorTask(void *pvParameters) {
     if (gps.time.isValid()) {
       entry.time_hour = gps.time.hour(); entry.time_min = gps.time.minute(); entry.time_sec = gps.time.second(); entry.time_cs = gps.time.centisecond();
     }
+    // --- オイラー角計算タスクへ IMU データを送信 ---
+    IMUData imuData;
+    imuData.ax = entry.ax; imuData.ay = entry.ay; imuData.az = entry.az;
+    imuData.gx = entry.gx; imuData.gy = entry.gy; imuData.gz = entry.gz;
+    imuData.cx = entry.cx; imuData.cy = entry.cy; imuData.cz = entry.cz;
+    imuData.timestamp = entry.timestamp;
+    xQueueSend(xIMUQueue, &imuData, 0); // ノンブロッキング送信
+
+    // --- 最新のオイラー角をログエントリに格納 ---
+    entry.roll  = sharedRoll;
+    entry.pitch = sharedPitch;
+    entry.yaw   = sharedYaw;
+
     xQueueSend(xQueue, &entry, pdMS_TO_TICKS(1));
   }
 }
@@ -283,6 +368,7 @@ void sdFlushTask(void *pvParameters) {
 // (変更なし)
 //================================================================
 void setup() {
+    vTaskDelay(pdMS_TO_TICKS(1000)); // 起動直後の安定化のための短い遅延
     pinMode(error_ledpin, OUTPUT );
     pinMode(stat_ledpin, OUTPUT );
     digitalWrite(error_ledpin, LOW);
@@ -320,10 +406,17 @@ void setup() {
       digitalWrite(error_ledpin, HIGH);
       while(1);
     }
+    xIMUQueue = xQueueCreate(IMU_QUEUE_LENGTH, sizeof(IMUData));
+    if (xIMUQueue == NULL) {
+      Serial.println("IMU Queue creation failed!");
+      digitalWrite(error_ledpin, HIGH);
+      while(1);
+    }
 
-    xTaskCreatePinnedToCore(sdWriteTask, "SDWriteTask", 4096, NULL, 1, &hSdWriteTask, 1);
-    xTaskCreatePinnedToCore(sdFlushTask, "SDFlushTask", 2048, NULL, 0, &hSdFlushTask, 1);
-    xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 2, &hSensorTask, 0);
+    xTaskCreatePinnedToCore(sdWriteTask,  "SDWriteTask", 4096, NULL, 1, &hSdWriteTask, 1);
+    xTaskCreatePinnedToCore(sdFlushTask,  "SDFlushTask", 2048, NULL, 0, &hSdFlushTask, 1);
+    xTaskCreatePinnedToCore(eulerTask,    "EulerTask",   4096, NULL, 1, &hEulerTask,   0);
+    xTaskCreatePinnedToCore(sensorTask,   "SensorTask",  4096, NULL, 2, &hSensorTask,  0);
 }
 
 //================================================================
