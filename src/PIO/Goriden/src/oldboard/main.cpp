@@ -72,7 +72,7 @@ QMC5883LCompass compass;
 
 //================================================================
 // ★★★ バイナリロギング用 構造体 (Struct) ★★★
-// (前回の gps_updated を含むバージョンから変更なし)
+// (オイラー角をクォータニオンに変更)
 //================================================================
 #pragma pack(push, 1)
 struct LogEntry {
@@ -88,7 +88,7 @@ struct LogEntry {
   uint8_t  date_month, date_day;
   uint8_t  time_hour, time_min, time_sec, time_cs;
   uint8_t  gps_updated; // GPS座標が更新されたかのフラグ
-  float roll, pitch, yaw; // オイラー角 (度)
+  float q0, q1, q2, q3; // クォータニオン (q0 = スカラー部)
 };
 #pragma pack(pop)
 
@@ -113,10 +113,11 @@ QueueHandle_t xIMUQueue;
 #define QUEUE_LENGTH 50
 #define IMU_QUEUE_LENGTH 10
 
-// ★★★ 共有オイラー角 (タスク間で参照) ★★★
-volatile float sharedRoll  = 0.0f;
-volatile float sharedPitch = 0.0f;
-volatile float sharedYaw   = 0.0f;
+// ★★★ 共有クォータニオン (タスク間で参照) ★★★
+volatile float sharedQ0 = 1.0f; // 初期値は単位クォータニオン
+volatile float sharedQ1 = 0.0f;
+volatile float sharedQ2 = 0.0f;
+volatile float sharedQ3 = 0.0f;
 
 // ★★★ シリアル表示用 最新エントリの共有コピー ★★★
 LogEntry latestEntry;
@@ -162,15 +163,104 @@ void qmcsetup(){
 
 
 //================================================================
-// ★ Task D (Core 0, Prio 1): オイラー角計算 (相補フィルタ)
+// ★ Task D (Core 0, Prio 1): クォータニオン計算 (相補フィルタ)
 //================================================================
-void eulerTask(void *pvParameters) {
-  Serial.println("Euler Task started on Core 0 (Prio 1)");
+// ヘルパー関数: 加速度からクォータニオンを算出
+void accelToQuaternion(float ax, float ay, float az, float &q0, float &q1, float &q2, float &q3) {
+  float norm = sqrtf(ax * ax + ay * ay + az * az);
+  if (norm == 0.0f) return;
+  ax /= norm; ay /= norm; az /= norm;
+  
+  // ロール・ピッチをクォータニオンに変換 (ヨーは0と仮定)
+  float roll  = atan2f(ay, az);
+  float pitch = atan2f(-ax, sqrtf(ay * ay + az * az));
+  
+  float cr = cosf(roll * 0.5f);
+  float sr = sinf(roll * 0.5f);
+  float cp = cosf(pitch * 0.5f);
+  float sp = sinf(pitch * 0.5f);
+  
+  q0 = cr * cp;
+  q1 = sr * cp;
+  q2 = cr * sp;
+  q3 = -sr * sp;
+}
 
-  float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
+// ヘルパー関数: クォータニオンの正規化
+void normalizeQuaternion(float &q0, float &q1, float &q2, float &q3) {
+  float norm = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  if (norm > 0.0f) {
+    q0 /= norm; q1 /= norm; q2 /= norm; q3 /= norm;
+  }
+}
+
+// ヘルパー関数: ジャイロをクォータニオン微分に変換して積分
+void updateQuaternionFromGyro(float &q0, float &q1, float &q2, float &q3, 
+                              float gx, float gy, float gz, float dt) {
+  // deg->rad に変換
+  float gxRad = gx * PI / 180.0f;
+  float gyRad = gy * PI / 180.0f;
+  float gzRad = gz * PI / 180.0f;
+  
+  // クォータニオン微分: dq = 0.5 * q * w (w: 角速度ベクトル)
+  float dq0 = 0.5f * (-q1 * gxRad - q2 * gyRad - q3 * gzRad) * dt;
+  float dq1 = 0.5f * ( q0 * gxRad + q2 * gzRad - q3 * gyRad) * dt;
+  float dq2 = 0.5f * ( q0 * gyRad - q1 * gzRad + q3 * gxRad) * dt;
+  float dq3 = 0.5f * ( q0 * gzRad + q1 * gyRad - q2 * gxRad) * dt;
+  
+  q0 += dq0;
+  q1 += dq1;
+  q2 += dq2;
+  q3 += dq3;
+  
+  normalizeQuaternion(q0, q1, q2, q3);
+}
+
+// ヘルパー関数: チルト補正付き地磁気からヨーを推定してクォータニオンに反映
+void correctQuaternionWithMag(float &q0, float &q1, float &q2, float &q3,
+                              int16_t cx, int16_t cy, int16_t cz) {
+  // 地磁気ベクトルを正規化
+  float norm = sqrtf(cx * cx + cy * cy + cz * cz);
+  if (norm == 0.0f) return;
+  float mx = cx / norm, my = cy / norm, mz = cz / norm;
+  
+  // クォータニオンで地磁気ベクトルを回転させて地球座標系にマップ
+  float rotMx = (1 - 2 * (q2 * q2 + q3 * q3)) * mx + 2 * (q1 * q2 - q0 * q3) * my + 2 * (q1 * q3 + q0 * q2) * mz;
+  float rotMy = 2 * (q1 * q2 + q0 * q3) * mx + (1 - 2 * (q1 * q1 + q3 * q3)) * my + 2 * (q2 * q3 - q0 * q1) * mz;
+  
+  // 望ましいヨーを計算 (地磁気の水平成分から)
+  float desiredYaw = atan2f(-rotMy, rotMx);
+  
+  // 現在のヨーを抽出
+  float roll = atan2f(2 * (q0 * q1 + q2 * q3), 1 - 2 * (q1 * q1 + q2 * q2));
+  float pitch = asinf(2 * (q0 * q2 - q3 * q1));
+  float yaw = atan2f(2 * (q0 * q3 + q1 * q2), 1 - 2 * (q2 * q2 + q3 * q3));
+  
+  // ヨー誤差を少量修正 (低ゲイン補正)
+  float yawError = desiredYaw - yaw;
+  // yawErrorを[-pi, pi]に正規化
+  while (yawError > PI) yawError -= 2 * PI;
+  while (yawError < -PI) yawError += 2 * PI;
+  
+  // ヨー補正をクォータニオンに適用 (小さなクォータニオン回転)
+  float corrQ0 = cosf(yawError * 0.05f * 0.5f);  // 低ゲイン: 0.05
+  float corrQ3 = sinf(yawError * 0.05f * 0.5f);
+  
+  // クォータニオン乗算: q = corrQ * q
+  float newQ0 = corrQ0 * q0 - corrQ3 * q3;
+  float newQ1 = corrQ0 * q1 - corrQ3 * q2;
+  float newQ2 = corrQ0 * q2 + corrQ3 * q1;
+  float newQ3 = corrQ0 * q3 + corrQ3 * q0;
+  
+  q0 = newQ0; q1 = newQ1; q2 = newQ2; q3 = newQ3;
+  normalizeQuaternion(q0, q1, q2, q3);
+}
+
+void eulerTask(void *pvParameters) {
+  Serial.println("Quaternion Task started on Core 0 (Prio 1)");
+
+  float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;  // 単位クォータニオンで初期化
   const float alpha = 0.98f;  // 相補フィルタ係数 (ジャイロ信頼度)
-  const float RAD_TO_DEG_F = 180.0f / PI;
-  const float DEG_TO_RAD_F = PI / 180.0f;
   uint32_t lastTime = 0;
   bool initialized = false;
   IMUData imu;
@@ -178,41 +268,40 @@ void eulerTask(void *pvParameters) {
   for (;;) {
     if (xQueueReceive(xIMUQueue, &imu, portMAX_DELAY) == pdPASS) {
 
-      // --- 加速度からロール・ピッチを算出 ---
-      float rollAcc  = atan2f(imu.ay, imu.az) * RAD_TO_DEG_F;
-      float pitchAcc = atan2f(-imu.ax, sqrtf(imu.ay * imu.ay + imu.az * imu.az)) * RAD_TO_DEG_F;
-
-      // --- チルト補正付き地磁気からヨーを算出 ---
-      float rRad = rollAcc * DEG_TO_RAD_F;
-      float pRad = pitchAcc * DEG_TO_RAD_F;
-      float magX = imu.cx * cosf(pRad) + imu.cz * sinf(pRad);
-      float magY = imu.cx * sinf(rRad) * sinf(pRad)
-                 + imu.cy * cosf(rRad)
-                 - imu.cz * sinf(rRad) * cosf(pRad);
-      float yawMag = atan2f(-magY, magX) * RAD_TO_DEG_F;
-
       if (!initialized) {
-        // 初回: 加速度+地磁気の値で初期化
-        roll  = rollAcc;
-        pitch = pitchAcc;
-        yaw   = yawMag;
-        lastTime    = imu.timestamp;
+        // 初回: 加速度からクォータニオンを初期化
+        accelToQuaternion(imu.ax, imu.ay, imu.az, q0, q1, q2, q3);
+        lastTime = imu.timestamp;
         initialized = true;
       } else {
         float dt = (imu.timestamp - lastTime) / 1000.0f; // 秒
         lastTime = imu.timestamp;
         if (dt <= 0.0f || dt > 0.5f) continue; // 異常な dt はスキップ
 
-        // 相補フィルタ: ジャイロ積分 + 加速度/地磁気補正
-        roll  = alpha * (roll  + imu.gx * dt) + (1.0f - alpha) * rollAcc;
-        pitch = alpha * (pitch + imu.gy * dt) + (1.0f - alpha) * pitchAcc;
-        yaw   = alpha * (yaw   + imu.gz * dt) + (1.0f - alpha) * yawMag;
+        // ジャイロでクォータニオンを更新
+        float q0_gyro = q0, q1_gyro = q1, q2_gyro = q2, q3_gyro = q3;
+        updateQuaternionFromGyro(q0_gyro, q1_gyro, q2_gyro, q3_gyro, imu.gx, imu.gy, imu.gz, dt);
+
+        // 加速度からクォータニオンを推定
+        float q0_acc, q1_acc, q2_acc, q3_acc;
+        accelToQuaternion(imu.ax, imu.ay, imu.az, q0_acc, q1_acc, q2_acc, q3_acc);
+
+        // 相補フィルタ: ジャイロ優先 + 加速度補正
+        q0 = alpha * q0_gyro + (1.0f - alpha) * q0_acc;
+        q1 = alpha * q1_gyro + (1.0f - alpha) * q1_acc;
+        q2 = alpha * q2_gyro + (1.0f - alpha) * q2_acc;
+        q3 = alpha * q3_gyro + (1.0f - alpha) * q3_acc;
+        normalizeQuaternion(q0, q1, q2, q3);
+
+        // 地磁気でヨーを補正
+        correctQuaternionWithMag(q0, q1, q2, q3, imu.cx, imu.cy, imu.cz);
       }
 
       // 共有変数に書き込み
-      sharedRoll  = roll;
-      sharedPitch = pitch;
-      sharedYaw   = yaw;
+      sharedQ0 = q0;
+      sharedQ1 = q1;
+      sharedQ2 = q2;
+      sharedQ3 = q3;
     }
   }
 }
@@ -289,10 +378,11 @@ void sensorTask(void *pvParameters) {
     imuData.timestamp = entry.timestamp;
     xQueueSend(xIMUQueue, &imuData, 0); // ノンブロッキング送信
 
-    // --- 最新のオイラー角をログエントリに格納 ---
-    entry.roll  = sharedRoll;
-    entry.pitch = sharedPitch;
-    entry.yaw   = sharedYaw;
+    // --- 最新のクォータニオンをログエントリに格納 ---
+    entry.q0 = sharedQ0;
+    entry.q1 = sharedQ1;
+    entry.q2 = sharedQ2;
+    entry.q3 = sharedQ3;
 
     // --- シリアル表示タスク用に最新エントリをコピー ---
     portENTER_CRITICAL(&entryMux);
@@ -321,7 +411,7 @@ void serialPrintTask(void *pvParameters) {
                   "Mag:%d,%d,%d "
                   "GPS:lat:%.6f,lng:%.6f,alt:%.1f,sat:%d "
                   "Date:%d/%d/%d %d:%02d:%02d.%02d "
-                  "RPY:%.1f,%.1f,%.1f upd:%d\n",
+                  "Quat:%.4f,%.4f,%.4f,%.4f upd:%d\n",
                   e.timestamp,
                   e.temp, e.pres, e.alt, e.hum,
                   e.ax, e.ay, e.az,
@@ -330,7 +420,7 @@ void serialPrintTask(void *pvParameters) {
                   e.lat / 1e6, e.lng / 1e6, e.gps_alt, e.sats,
                   e.date_year, e.date_month, e.date_day,
                   e.time_hour, e.time_min, e.time_sec, e.time_cs,
-                  e.roll, e.pitch, e.yaw,
+                  e.q0, e.q1, e.q2, e.q3,
                   e.gps_updated);
   }
 }
