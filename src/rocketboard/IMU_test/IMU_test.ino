@@ -1,8 +1,8 @@
 #include <Wire.h>
 #include "BMI2_BMM1.h"
 
-#define SDA_PIN 37
-#define SCL_PIN 36
+#define SDA_PIN 17
+#define SCL_PIN 16
 
 // ±2000 dps設定時のスケール係数（BMI270標準）
 #define GYRO_SCALE_2000DPS (1.0f / 16.4f)

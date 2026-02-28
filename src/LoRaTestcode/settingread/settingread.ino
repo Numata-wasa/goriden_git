@@ -1,11 +1,11 @@
 #include <Arduino.h>
 
 // ピン定義 (ESP32-S3)
-#define E220_RX 44
-#define E220_TX 43
-#define E220_M0 40
-#define E220_M1 39
-#define E220_AUX 38
+#define E220_RX 39
+#define E220_TX 38
+#define E220_M0 12
+#define E220_M1 11
+#define E220_AUX 40
 
 void waitAUX() {
   while (digitalRead(E220_AUX) == LOW) {
