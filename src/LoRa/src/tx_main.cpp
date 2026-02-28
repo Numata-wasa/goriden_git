@@ -1,7 +1,7 @@
 #include <Arduino.h>
 
 // ===================================================
-// E220 LoRa モジュール受信機 (RX)
+// E220 LoRa モジュール送信機 (TX)
 // ===================================================
 
 // 関数の前方宣言
@@ -9,13 +9,14 @@ void setE220Mode(uint8_t mode);
 void waitAUX();
 void readE220Settings();
 void writeE220Settings();
+void sendLoRaData(uint8_t* data, uint8_t length);
 
-// E220 ピン定義 (RX基板)
+// E220 ピン定義 (TX基板)
 #define E220_RX 39
-#define E220_TX 38
-#define E220_M0 12
-#define E220_M1 11
-#define E220_AUX 40
+#define E220_TX 40
+#define E220_M0 43
+#define E220_M1 44
+#define E220_AUX 38
 
 // STAT LED
 #define STAT_LED 42
@@ -32,20 +33,17 @@ void writeE220Settings();
 #define E220_MODE_POWERDOWN 2   // M0=0, M1=1
 #define E220_MODE_CONFIG 3      // M0=1, M1=1
 
-// LED制御
-unsigned long ledOnTime = 0;
-bool ledOn = false;
+// 送信間隔（ミリ秒）
+#define SEND_INTERVAL 3000
 
-// 遷移記録用バッファ
-#define MAX_TRANSITIONS 300
-static unsigned long transTime[MAX_TRANSITIONS];
-static uint8_t transLevel[MAX_TRANSITIONS];
+unsigned long lastSendTime = 0;
+uint8_t messageCounter = 0;
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n\n========================================");
-  Serial.println("  E220 LoRa Receiver (RX)");
+  Serial.println("  E220 LoRa Transmitter (TX)");
   Serial.println("========================================");
 
   // ピン初期化
@@ -84,191 +82,57 @@ void setup() {
 
   // ============================================
   // STEP 2: ノーマルモードに切り替え
-  // Serial1を完全解放 → GPIO直接監視モード
   // ============================================
-  Serial.println("\n[STEP 2] Normal mode...");
+  Serial.println("\n[STEP 2] Normal mode (" + String(E220_NORMAL_BAUD) + " bps)...");
   
-  // バッファクリア
+  // ボーレート変更が必要な場合
+  if (E220_NORMAL_BAUD != E220_CONFIG_BAUD) {
+    Serial1.end();
+    Serial1.begin(E220_NORMAL_BAUD, SERIAL_8N1, E220_RX, E220_TX);
+    delay(100);
+  }
+  
+  // バッファクリア（コンフィグモードの残留データ除去）
   while (Serial1.available()) Serial1.read();
-  
+  delay(50);
+
   setE220Mode(E220_MODE_NORMAL);
   waitAUX();
+
+  // ノーマルモード切替後もバッファクリア
   delay(100);
   while (Serial1.available()) Serial1.read();
 
-  // Serial1を完全解放（UART周辺機器がGPIO39を占有するのを防ぐ）
-  Serial1.end();
-  delay(50);
-  pinMode(E220_RX, INPUT_PULLUP);
-  pinMode(E220_TX, INPUT);  // TX出力も念のため解放
-  delay(50);
-  
-  Serial.print("  GPIO"); Serial.print(E220_RX); Serial.print(" (E220_TXD) = ");
-  Serial.println(digitalRead(E220_RX) ? "HIGH (idle OK)" : "LOW (!!)");
-  Serial.print("  AUX=");
-  Serial.println(digitalRead(E220_AUX) ? "HIGH" : "LOW");
-
   Serial.println("\n========================================");
-  Serial.println("  GPIO transition recorder active");
-  Serial.println("  Serial1 RELEASED - pure digitalRead");
-  Serial.println("  Cycle 1,3,5: transition timing");
-  Serial.println("  Cycle 2,4,6: Serial1 @1200 baud test");
+  Serial.println("  Ready to transmit! Interval: " + String(SEND_INTERVAL) + " ms");
   Serial.println("========================================\n");
+  
+  lastSendTime = millis();
 }
 
-// ============================================
-// 診断用変数
-// ============================================
-static bool lastAux = true;
-static int  rxCycleCount = 0;
-static bool serial1Active = false;  // Serial1 がアクティブか
-
 void loop() {
-  bool aux = digitalRead(E220_AUX);
-
-  if (lastAux && !aux) {
-    rxCycleCount++;
-    unsigned long t = millis();
-    Serial.println();
-    Serial.print("=== ["); Serial.print(t); Serial.print("] AUX FELL (cycle #");
-    Serial.print(rxCycleCount); Serial.println(") ===");
-
-    if (rxCycleCount % 2 == 1) {
-      // ==========================================
-      // 奇数サイクル: GPIO直接・精密遷移タイミング記録
-      // Serial1 は解放済み、純粋 digitalRead
-      // ==========================================
-      if (serial1Active) {
-        Serial1.end();
-        delay(10);
-        pinMode(E220_RX, INPUT_PULLUP);
-        serial1Active = false;
-      }
-
-      Serial.println("  [MODE: GPIO transition recorder]");
-
-      // 高速遷移記録 (delay無し、最大速度)
-      int tCount = 0;
-      uint8_t lastLevel = digitalRead(E220_RX);
-      transTime[0] = micros();
-      transLevel[0] = lastLevel;
-      tCount = 1;
-
-      unsigned long startUs = micros();
-      unsigned long loopCount = 0;
-      while (micros() - startUs < 100000 && tCount < MAX_TRANSITIONS) {
-        uint8_t level = digitalRead(E220_RX);
-        if (level != lastLevel) {
-          transTime[tCount] = micros();
-          transLevel[tCount] = level;
-          tCount++;
-          lastLevel = level;
-        }
-        loopCount++;
-      }
-      unsigned long endUs = micros();
-
-      Serial.print("  Monitored "); Serial.print((endUs - startUs) / 1000);
-      Serial.print("ms, "); Serial.print(loopCount);
-      Serial.print(" iterations (~"); Serial.print(loopCount > 0 ? (endUs - startUs) / loopCount : 0);
-      Serial.println("us/iter)");
-      Serial.print("  Transitions: "); Serial.println(tCount - 1);
-
-      if (tCount > 1) {
-        Serial.println("  --- Transition table ---");
-        Serial.println("    #   time_us   delta_us  level");
-        for (int i = 0; i < tCount; i++) {
-          unsigned long delta = (i > 0) ? (transTime[i] - transTime[i - 1]) : 0;
-          Serial.print("    ");
-          if (i < 10) Serial.print(" ");
-          Serial.print(i);
-          Serial.print("  ");
-          Serial.print(transTime[i] - transTime[0]);
-          Serial.print("\t");
-          Serial.print(delta);
-          Serial.print("\t");
-          Serial.println(transLevel[i]);
-        }
-
-        // ビット幅分析
-        unsigned long totalSpan = transTime[tCount - 1] - transTime[1];
-        Serial.print("  Total span: "); Serial.print(totalSpan); Serial.println("us");
-        if (tCount > 2) {
-          // 最小・最大パルス幅
-          unsigned long minPulse = 999999, maxPulse = 0;
-          for (int i = 2; i < tCount; i++) {
-            unsigned long pw = transTime[i] - transTime[i - 1];
-            if (pw < minPulse) minPulse = pw;
-            if (pw > maxPulse) maxPulse = pw;
-          }
-          Serial.print("  Pulse widths: min="); Serial.print(minPulse);
-          Serial.print("us, max="); Serial.print(maxPulse); Serial.println("us");
-          
-          // 1200/2400/9600 baud判定
-          if (minPulse > 600 && minPulse < 1100) Serial.println("  >>> Likely 1200 baud (bit=833us)");
-          else if (minPulse > 300 && minPulse < 600) Serial.println("  >>> Likely 2400 baud (bit=417us)");
-          else if (minPulse > 80 && minPulse < 150) Serial.println("  >>> Likely 9600 baud (bit=104us)");
-          else if (minPulse > 40 && minPulse < 80) Serial.println("  >>> Likely 19200 baud (bit=52us)");
-          else { Serial.print("  >>> Unknown baud (min pulse="); Serial.print(minPulse); Serial.println("us)"); }
-        }
-      } else {
-        Serial.print("  *** NO TRANSITIONS - GPIO"); Serial.print(E220_RX);
-        Serial.print(" stuck at "); Serial.print(transLevel[0]); Serial.println(" ***");
-      }
-
-    } else {
-      // ==========================================
-      // 偶数サイクル: Serial1 @1200 baud でUART読み取り
-      // (SPED書き込みが反映されていない場合、元の1200で出力されるはず)
-      // ==========================================
-      if (!serial1Active) {
-        Serial1.begin(1200, SERIAL_8N1, E220_RX, E220_TX);
-        delay(10);
-        while (Serial1.available()) Serial1.read();
-        serial1Active = true;
-      }
-
-      Serial.println("  [MODE: Serial1 @1200 baud]");
-
-      // 100ms待ってからデータ収集 (1200baud: 7bytes ≈ 58ms)
-      delay(100);
-
-      int uartBytes = 0;
-      uint8_t buf[32];
-      while (Serial1.available() && uartBytes < 32) {
-        buf[uartBytes++] = Serial1.read();
-      }
-
-      Serial.print("  Received: ");
-      if (uartBytes == 0) {
-        Serial.println("(none)");
-      } else {
-        for (int i = 0; i < uartBytes; i++) {
-          Serial.print("0x");
-          if (buf[i] < 0x10) Serial.print("0");
-          Serial.print(buf[i], HEX);
-          Serial.print(" ");
-        }
-        Serial.print("  ["); Serial.print(uartBytes); Serial.println(" bytes]");
-        
-        // マーカー検索
-        for (int i = 0; i < uartBytes; i++) {
-          if (buf[i] == 0xAA) Serial.println("  >>> MARKER 0xAA FOUND! <<<");
-          if (buf[i] == 0x55) Serial.println("  >>> MARKER 0x55 FOUND! <<<");
-        }
-      }
-
-      // 次サイクルのためにSerial1解放
-      Serial1.end();
-      delay(10);
-      pinMode(E220_RX, INPUT_PULLUP);
-      serial1Active = false;
+  if (millis() - lastSendTime >= SEND_INTERVAL) {
+    lastSendTime = millis();
+    
+    // 識別しやすいテストデータ
+    // マーカー: AA 55 + カウンタ + "TEST"
+    uint8_t testData[16];
+    int len = 0;
+    
+    testData[len++] = 0xAA;  // マーカー1
+    testData[len++] = 0x55;  // マーカー2
+    testData[len++] = messageCounter++;
+    
+    // テキスト "TEST"
+    const char* msg = "TEST";
+    for (int i = 0; msg[i] != '\0'; i++) {
+      testData[len++] = (uint8_t)msg[i];
     }
-
-    Serial.println();
+    
+    sendLoRaData(testData, len);
   }
 
-  lastAux = aux;
+  delay(100);
 }
 
 // ============================================
@@ -448,18 +312,14 @@ void writeE220Settings() {
     0x00, 0x00          // CRYPT_H, CRYPT_L
   };
 
-  // デバッグ表示
   Serial.print("  CMD: ");
   for (int i = 0; i < 11; i++) {
+    Serial1.write(cmd[i]);
     if (cmd[i] < 0x10) Serial.print("0");
     Serial.print(cmd[i], HEX);
     Serial.print(" ");
   }
   Serial.println();
-
-  // 一括送信（バイト間遅延を排除）
-  Serial1.write(cmd, 11);
-  Serial1.flush();  // 送信完了まで待機
 
   // 応答受信: C1 00 08 + 8バイトデータ = 11バイト
   uint8_t resp[16];
@@ -486,4 +346,37 @@ void writeE220Settings() {
   } else {
     Serial.println("  WARNING: Write may have failed!");
   }
+}
+
+// ============================================
+// E220 データ送信
+// ============================================
+void sendLoRaData(uint8_t* data, uint8_t length) {
+  // LED点灯
+  digitalWrite(STAT_LED, HIGH);
+
+  // AUX HIGH待ち（送信可能状態）
+  unsigned long w = millis();
+  while (digitalRead(E220_AUX) == LOW && millis() - w < 1000) {
+    delay(1);
+  }
+
+  // 送信
+  Serial1.write(data, length);
+
+  Serial.print("[TX #");
+  Serial.print(messageCounter);
+  Serial.print("] ");
+  Serial.print(length);
+  Serial.print(" bytes: ");
+  for (int i = 0; i < length; i++) {
+    if (data[i] < 0x10) Serial.print("0");
+    Serial.print(data[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.print(" AUX=");
+  Serial.println(digitalRead(E220_AUX) ? "HIGH" : "LOW");
+
+  delay(200);
+  digitalWrite(STAT_LED, LOW);
 }
