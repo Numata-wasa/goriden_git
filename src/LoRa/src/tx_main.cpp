@@ -1,14 +1,16 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 
 // ===================================================
 // E220 LoRa モジュール送信機 (TX)
+// CRYPT不一致を修正 + REG0からbaud自動検出
 // ===================================================
 
 // 関数の前方宣言
 void setE220Mode(uint8_t mode);
 void waitAUX();
+long readE220AndDetectBaud();
+bool writeAllSettings(uint8_t cryptH, uint8_t cryptL);
 void readE220Settings();
-void writeE220Settings();
 void sendLoRaData(uint8_t* data, uint8_t length);
 
 // E220 ピン定義 (TX基板)
@@ -22,16 +24,15 @@ void sendLoRaData(uint8_t* data, uint8_t length);
 #define STAT_LED 42
 
 // E220 設定
-// ※ コンフィグモード(M0=1,M1=1)では常に9600bps固定
-// ※ ノーマルモードではモジュールのSPED設定に従う
 #define E220_CONFIG_BAUD 9600
-#define E220_NORMAL_BAUD 9600
+// ノーマルモードのボーレートはREG0から自動検出
+long detectedBaud = 9600;
 
 // E220 動作モード定義
-#define E220_MODE_NORMAL 0      // M0=0, M1=0
-#define E220_MODE_WAKEUP 1      // M0=1, M1=0
-#define E220_MODE_POWERDOWN 2   // M0=0, M1=1
-#define E220_MODE_CONFIG 3      // M0=1, M1=1
+#define E220_MODE_NORMAL 0
+#define E220_MODE_WAKEUP 1
+#define E220_MODE_POWERDOWN 2
+#define E220_MODE_CONFIG 3
 
 // 送信間隔（ミリ秒）
 #define SEND_INTERVAL 3000
@@ -43,24 +44,22 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n\n========================================");
-  Serial.println("  E220 LoRa Transmitter (TX)");
+  Serial.println("  E220 LoRa Transmitter (TX) v5");
+  Serial.println("  CRYPT fix + auto baud detect");
   Serial.println("========================================");
 
-  // ピン初期化
   pinMode(STAT_LED, OUTPUT);
   digitalWrite(STAT_LED, LOW);
   pinMode(E220_M0, OUTPUT);
   pinMode(E220_M1, OUTPUT);
   pinMode(E220_AUX, INPUT);
 
-  // ピン情報表示
   Serial.println("[PIN] RX=" + String(E220_RX) + " TX=" + String(E220_TX) +
                  " M0=" + String(E220_M0) + " M1=" + String(E220_M1) +
                  " AUX=" + String(E220_AUX));
 
   // ============================================
-  // STEP 1: コンフィグモードで設定読み込み
-  // コンフィグモードは常に9600bps
+  // STEP 1: コンフィグモード (常に9600bps)
   // ============================================
   Serial.println("\n[STEP 1] Config mode (9600 bps)...");
   setE220Mode(E220_MODE_CONFIG);
@@ -68,67 +67,55 @@ void setup() {
   delay(500);
   waitAUX();
 
-  Serial.println("\n[STEP 1a] Reading current settings...");
-  readE220Settings();
+  // 設定読み込み + baud検出（書き込みは行わない）
+  Serial.println("\n[STEP 1a] Reading settings & detecting baud...");
+  detectedBaud = readE220AndDetectBaud();
   delay(200);
-
-  Serial.println("\n[STEP 1b] Writing unified settings...");
-  writeE220Settings();
-  delay(200);
-
-  Serial.println("\n[STEP 1c] Verifying settings...");
-  readE220Settings();
-  delay(200);
+  // 注: 0x07-0x08のバイトはJP版では読み取り専用の可能性あり
+  // 書き込み(C0 00 09, C0 07 02)は全て拒否されるため省略
 
   // ============================================
-  // STEP 2: ノーマルモードに切り替え
+  // STEP 2: ノーマルモードへ切り替え
+  // Serial1を検出ボーレートに変更
   // ============================================
-  Serial.println("\n[STEP 2] Normal mode (" + String(E220_NORMAL_BAUD) + " bps)...");
-  
-  // ボーレート変更が必要な場合
-  if (E220_NORMAL_BAUD != E220_CONFIG_BAUD) {
-    Serial1.end();
-    Serial1.begin(E220_NORMAL_BAUD, SERIAL_8N1, E220_RX, E220_TX);
-    delay(100);
-  }
-  
-  // バッファクリア（コンフィグモードの残留データ除去）
-  while (Serial1.available()) Serial1.read();
+  Serial.println("\n[STEP 2] Normal mode (" + String(detectedBaud) + " bps)...");
+
+  Serial1.end();
   delay(50);
+  Serial1.begin(detectedBaud, SERIAL_8N1, E220_RX, E220_TX);
+  delay(100);
+
+  while (Serial1.available()) Serial1.read();
 
   setE220Mode(E220_MODE_NORMAL);
   waitAUX();
-
-  // ノーマルモード切替後もバッファクリア
   delay(100);
   while (Serial1.available()) Serial1.read();
 
   Serial.println("\n========================================");
   Serial.println("  Ready to transmit! Interval: " + String(SEND_INTERVAL) + " ms");
+  Serial.println("  Baud=" + String(detectedBaud) + " bps");
   Serial.println("========================================\n");
-  
+
   lastSendTime = millis();
 }
 
 void loop() {
   if (millis() - lastSendTime >= SEND_INTERVAL) {
     lastSendTime = millis();
-    
-    // 識別しやすいテストデータ
-    // マーカー: AA 55 + カウンタ + "TEST"
+
     uint8_t testData[16];
     int len = 0;
-    
+
     testData[len++] = 0xAA;  // マーカー1
     testData[len++] = 0x55;  // マーカー2
     testData[len++] = messageCounter++;
-    
-    // テキスト "TEST"
+
     const char* msg = "TEST";
     for (int i = 0; msg[i] != '\0'; i++) {
       testData[len++] = (uint8_t)msg[i];
     }
-    
+
     sendLoRaData(testData, len);
   }
 
@@ -156,23 +143,19 @@ void waitAUX() {
 void setE220Mode(uint8_t mode) {
   switch (mode) {
     case E220_MODE_NORMAL:
-      digitalWrite(E220_M0, LOW);
-      digitalWrite(E220_M1, LOW);
+      digitalWrite(E220_M0, LOW);  digitalWrite(E220_M1, LOW);
       Serial.println("  Mode -> Normal (M0=0, M1=0)");
       break;
     case E220_MODE_WAKEUP:
-      digitalWrite(E220_M0, HIGH);
-      digitalWrite(E220_M1, LOW);
+      digitalWrite(E220_M0, HIGH); digitalWrite(E220_M1, LOW);
       Serial.println("  Mode -> Wake-up (M0=1, M1=0)");
       break;
     case E220_MODE_POWERDOWN:
-      digitalWrite(E220_M0, LOW);
-      digitalWrite(E220_M1, HIGH);
+      digitalWrite(E220_M0, LOW);  digitalWrite(E220_M1, HIGH);
       Serial.println("  Mode -> Power down (M0=0, M1=1)");
       break;
     case E220_MODE_CONFIG:
-      digitalWrite(E220_M0, HIGH);
-      digitalWrite(E220_M1, HIGH);
+      digitalWrite(E220_M0, HIGH); digitalWrite(E220_M1, HIGH);
       Serial.println("  Mode -> Config (M0=1, M1=1)");
       break;
   }
@@ -180,35 +163,28 @@ void setE220Mode(uint8_t mode) {
 }
 
 // ============================================
-// E220 設定読み込み
-// コマンド: C1 ADDR LEN (3バイト)
-// 応答:    C1 ADDR LEN DATA[0..LEN-1]
+// E220 設定読み込み＋ボーレート自動検出
+// REG0[7:5] の UART baud 設定を解析して返す
 // ============================================
-void readE220Settings() {
-  // バッファクリア
+long readE220AndDetectBaud() {
   while (Serial1.available()) Serial1.read();
   delay(50);
 
-  // レジスタ0x00から8バイト読み込み (CRYPT含む)
-  uint8_t cmd[3] = {0xC1, 0x00, 0x08};
-
+  uint8_t cmd[3] = {0xC1, 0x00, 0x09};
   Serial.print("  CMD: ");
   for (int i = 0; i < 3; i++) {
-    Serial1.write(cmd[i]);
     if (cmd[i] < 0x10) Serial.print("0");
-    Serial.print(cmd[i], HEX);
-    Serial.print(" ");
+    Serial.print(cmd[i], HEX); Serial.print(" ");
   }
+  Serial1.write(cmd, 3);
+  Serial1.flush();
   Serial.println();
 
-  // 応答受信: C1 00 08 + 8バイトデータ = 11バイト
   uint8_t resp[16];
   int cnt = 0;
   unsigned long timeout = millis() + 2000;
-  while (millis() < timeout && cnt < 11) {
-    if (Serial1.available()) {
-      resp[cnt++] = Serial1.read();
-    }
+  while (millis() < timeout && cnt < 12) {
+    if (Serial1.available()) resp[cnt++] = Serial1.read();
   }
 
   Serial.print("  Response (");
@@ -216,119 +192,143 @@ void readE220Settings() {
   Serial.print(" bytes): ");
   for (int i = 0; i < cnt; i++) {
     if (resp[i] < 0x10) Serial.print("0");
-    Serial.print(resp[i], HEX);
-    Serial.print(" ");
+    Serial.print(resp[i], HEX); Serial.print(" ");
   }
   Serial.println();
 
-  // 応答解析
-  if (cnt >= 11 && resp[0] == 0xC1) {
-    // ヘッダ: resp[0]=C1, resp[1]=ADDR_H, resp[2]=LEN
-    // データ: resp[3..10] = REG0~REG7
-    uint8_t addh   = resp[3];
-    uint8_t addl   = resp[4];
-    uint8_t sped   = resp[5];
-    uint8_t opt    = resp[6];
-    uint8_t chan   = resp[7];
-    uint8_t opt2   = resp[8];
-    uint8_t cryptH = resp[9];
-    uint8_t cryptL = resp[10];
+  long baud = 9600;
 
-    Serial.println("  --- Register Values ---");
-    Serial.print("    ADDH=0x"); Serial.print(addh, HEX);
-    Serial.print(" ADDL=0x"); Serial.println(addl, HEX);
-    Serial.print("    SPED=0x"); Serial.println(sped, HEX);
+  if (cnt >= 12 && resp[0] == 0xC1) {
+    uint8_t reg0   = resp[6];
+    uint8_t cryptH = resp[10];
+    uint8_t cryptL = resp[11];
 
-    // SPED: [7:6]=Parity, [5:3]=Air Rate, [2:0]=UART Baud
-    //  ※ ビットバンガー診断で確認済み
-    Serial.print("      Parity: ");
-    switch ((sped >> 6) & 0x03) {
-      case 0: Serial.print("8N1"); break;
-      case 1: Serial.print("8O1"); break;
-      case 2: Serial.print("8E1"); break;
-      case 3: Serial.print("8N1"); break;
+    Serial.println("  --- Register Values (JP) ---");
+    Serial.print("    ADDH=0x"); Serial.print(resp[3], HEX);
+    Serial.print(" ADDL=0x"); Serial.println(resp[4], HEX);
+    Serial.print("    NETID=0x"); Serial.println(resp[5], HEX);
+    Serial.print("    REG0=0x"); Serial.print(reg0, HEX);
+
+    uint8_t uartBits = (reg0 >> 5) & 0x07;
+    switch (uartBits) {
+      case 0: baud = 1200;   break;
+      case 1: baud = 2400;   break;
+      case 2: baud = 4800;   break;
+      case 3: baud = 9600;   break;
+      case 4: baud = 19200;  break;
+      case 5: baud = 38400;  break;
+      case 6: baud = 57600;  break;
+      case 7: baud = 115200; break;
     }
-    Serial.print(", Uart: ");
-    switch (sped & 0x07) {
-      case 0: Serial.print("1200"); break;
-      case 1: Serial.print("2400"); break;
-      case 2: Serial.print("4800"); break;
-      case 3: Serial.print("9600"); break;
-      case 4: Serial.print("19200"); break;
-      case 5: Serial.print("38400"); break;
-      case 6: Serial.print("57600"); break;
-      case 7: Serial.print("115200"); break;
-    }
-    Serial.print(" bps, Air: ");
-    switch ((sped >> 3) & 0x07) {
-      case 0: case 1: Serial.print("2.4k"); break;
-      case 2: Serial.print("4.8k"); break;
-      case 3: Serial.print("9.6k"); break;
-      case 4: Serial.print("19.2k"); break;
-      case 5: Serial.print("38.4k"); break;
-      case 6: Serial.print("62.5k"); break;
-      case 7: Serial.print("Reserved"); break;
-    }
+    Serial.print(" -> UART "); Serial.print(baud);
     Serial.println(" bps");
 
-    Serial.print("    OPTION=0x"); Serial.println(opt, HEX);
-    Serial.print("    CHAN=0x"); Serial.print(chan, HEX);
-    Serial.print(" (Channel "); Serial.print(chan); Serial.println(")");
-    Serial.print("    OPTION2=0x"); Serial.println(opt2, HEX);
+    Serial.print("    REG1=0x"); Serial.println(resp[7], HEX);
+    Serial.print("    REG2=0x"); Serial.print(resp[8], HEX);
+    Serial.print(" (Ch "); Serial.print(resp[8]); Serial.println(")");
+    Serial.print("    REG3=0x"); Serial.println(resp[9], HEX);
     Serial.print("    CRYPT=0x");
     if (cryptH < 0x10) Serial.print("0"); Serial.print(cryptH, HEX);
     if (cryptL < 0x10) Serial.print("0"); Serial.println(cryptL, HEX);
+
+    if (cryptH != 0 || cryptL != 0) {
+      Serial.println("    *** WARNING: CRYPT is non-zero! ***");
+    }
+
+    Serial.println("  => Detected baud: " + String(baud));
   } else {
-    Serial.println("  WARNING: Unexpected response!");
-    Serial.println("  (E220 may not be connected or config mode not entered)");
+    Serial.println("  WARNING: Read failed! Using fallback 9600 bps");
+  }
+
+  return baud;
+}
+
+// ============================================
+// E220 設定読み込み（確認用）
+// ============================================
+void readE220Settings() {
+  while (Serial1.available()) Serial1.read();
+  delay(50);
+
+  uint8_t cmd[3] = {0xC1, 0x00, 0x09};
+  Serial.print("  CMD: ");
+  for (int i = 0; i < 3; i++) {
+    if (cmd[i] < 0x10) Serial.print("0");
+    Serial.print(cmd[i], HEX); Serial.print(" ");
+  }
+  Serial1.write(cmd, 3);
+  Serial1.flush();
+  Serial.println();
+
+  uint8_t resp[16];
+  int cnt = 0;
+  unsigned long timeout = millis() + 2000;
+  while (millis() < timeout && cnt < 12) {
+    if (Serial1.available()) resp[cnt++] = Serial1.read();
+  }
+
+  Serial.print("  Response (");
+  Serial.print(cnt);
+  Serial.print(" bytes): ");
+  for (int i = 0; i < cnt; i++) {
+    if (resp[i] < 0x10) Serial.print("0");
+    Serial.print(resp[i], HEX); Serial.print(" ");
+  }
+  Serial.println();
+
+  if (cnt >= 12 && resp[0] == 0xC1) {
+    Serial.print("    ADDH=0x"); Serial.print(resp[3], HEX);
+    Serial.print(" ADDL=0x"); Serial.println(resp[4], HEX);
+    Serial.print("    NETID=0x"); Serial.println(resp[5], HEX);
+    Serial.print("    REG0=0x"); Serial.println(resp[6], HEX);
+    Serial.print("    REG1=0x"); Serial.println(resp[7], HEX);
+    Serial.print("    REG2=0x"); Serial.println(resp[8], HEX);
+    Serial.print("    REG3=0x"); Serial.println(resp[9], HEX);
+    Serial.print("    CRYPT=0x");
+    if (resp[10] < 0x10) Serial.print("0"); Serial.print(resp[10], HEX);
+    if (resp[11] < 0x10) Serial.print("0"); Serial.println(resp[11], HEX);
   }
 }
 
 // ============================================
-// E220 設定書き込み（統一設定）
-// コマンド: C0 ADDR LEN DATA[0..LEN-1]
-// 応答:    C1 ADDR LEN DATA[0..LEN-1]
+// 全レジスタ書き込み (addr 0x00 から 9バイト)
+// 6バイト書き込み(C0 00 06)は成功実績あり
+// 9バイト(C0 00 09)でCRYPT含め一括書き込み
+// コマンド: C0 00 09 ADDH ADDL NETID REG0 REG1 REG2 REG3 CRYPT_H CRYPT_L
+// 応答:    C1 00 09 + 9バイト (成功時)
 // ============================================
-void writeE220Settings() {
-  // バッファクリア
+bool writeAllSettings(uint8_t cryptH, uint8_t cryptL) {
   while (Serial1.available()) Serial1.read();
   delay(50);
 
-  // 統一設定値
-  // ADDH=0x00, ADDL=0x00
-  // SPED=0x03: [7:6]=00(8N1), [5:3]=000(Air:2.4k), [2:0]=011(UART:9600)
-  //  ※ ビットバンガー診断で[2:0]=UART baudを確認済み
-  // OPTION=0x00
-  // CHAN=0x00 (Channel 0)
-  // OPTION2=0x00
-  // CRYPT=0x0000 (暗号化なし)
-  uint8_t cmd[11] = {
-    0xC0, 0x00, 0x08,   // Write command: addr=0x00, len=8
-    0x00, 0x00,         // ADDH, ADDL
-    0x03,               // SPED (8N1, Air:2.4k, UART:9600bps)
-    0x00,               // OPTION
-    0x00,               // CHAN (Channel 0)
-    0x00,               // OPTION2
-    0x00, 0x00          // CRYPT_H, CRYPT_L
+  // 現在の設定値を維持しつつ CRYPT だけ変更
+  uint8_t cmd[12] = {
+    0xC0, 0x00, 0x09,   // Write: addr=0x00, len=9
+    0x00, 0x00,         // ADDH=0, ADDL=0
+    0x03,               // NETID=0x03 (工場値維持)
+    0x62,               // REG0: UART 9600 / Air 2.4k
+    0x00,               // REG1: 13dBm
+    0x18,               // REG2: Ch24 (920.6MHz)
+    0x00,               // REG3: デフォルト
+    cryptH, cryptL      // CRYPT
   };
 
   Serial.print("  CMD: ");
-  for (int i = 0; i < 11; i++) {
-    Serial1.write(cmd[i]);
+  for (int i = 0; i < 12; i++) {
     if (cmd[i] < 0x10) Serial.print("0");
-    Serial.print(cmd[i], HEX);
-    Serial.print(" ");
+    Serial.print(cmd[i], HEX); Serial.print(" ");
   }
   Serial.println();
 
-  // 応答受信: C1 00 08 + 8バイトデータ = 11バイト
+  Serial1.write(cmd, 12);
+  Serial1.flush();
+
+  // 応答: C1 00 09 + 9バイト = 12バイト
   uint8_t resp[16];
   int cnt = 0;
   unsigned long timeout = millis() + 2000;
-  while (millis() < timeout && cnt < 11) {
-    if (Serial1.available()) {
-      resp[cnt++] = Serial1.read();
-    }
+  while (millis() < timeout && cnt < 12) {
+    if (Serial1.available()) resp[cnt++] = Serial1.read();
   }
 
   Serial.print("  Response (");
@@ -336,15 +336,19 @@ void writeE220Settings() {
   Serial.print(" bytes): ");
   for (int i = 0; i < cnt; i++) {
     if (resp[i] < 0x10) Serial.print("0");
-    Serial.print(resp[i], HEX);
-    Serial.print(" ");
+    Serial.print(resp[i], HEX); Serial.print(" ");
   }
   Serial.println();
 
-  if (cnt >= 11 && resp[0] == 0xC1) {
-    Serial.println("  Settings written successfully!");
+  if (cnt >= 12 && resp[0] == 0xC1 && resp[1] == 0x00 && resp[2] == 0x09) {
+    Serial.println("  All settings write SUCCESS!");
+    return true;
   } else {
-    Serial.println("  WARNING: Write may have failed!");
+    Serial.println("  Write FAILED!");
+    if (cnt >= 3 && resp[0] == 0xFF && resp[1] == 0xFF && resp[2] == 0xFF) {
+      Serial.println("  (Module rejected the command)");
+    }
+    return false;
   }
 }
 
@@ -352,16 +356,13 @@ void writeE220Settings() {
 // E220 データ送信
 // ============================================
 void sendLoRaData(uint8_t* data, uint8_t length) {
-  // LED点灯
   digitalWrite(STAT_LED, HIGH);
 
-  // AUX HIGH待ち（送信可能状態）
   unsigned long w = millis();
   while (digitalRead(E220_AUX) == LOW && millis() - w < 1000) {
     delay(1);
   }
 
-  // 送信
   Serial1.write(data, length);
 
   Serial.print("[TX #");

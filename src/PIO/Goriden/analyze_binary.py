@@ -4,8 +4,9 @@ import os # ファイル操作のために追加
 from datetime import datetime # 日付操作のために追加
 
 # ESP32の「struct LogEntry」と全く同じ構造
-# 修正版: クォータニオン(q0,q1,q2,q3) + オイラー角(roll,pitch,yaw)
-LOG_FORMAT = '<I ffff fff fff hhh iifB HBB BBBB B ffff fff'
+# 修正版: クォータニオン + オイラー角 + サーボ角度 + 誤差Q値 + accelTrust + 制御フラグ
+#        + 積分高度 + 積分速度 + Z軸自由落下加速度 + 発射フラグ
+LOG_FORMAT = '<I ffff fff fff hhh iifB HBB BBBB B ffff fff ff fff f B ff f B'
 LOG_SIZE = struct.calcsize(LOG_FORMAT)
 
 # CSVのヘッダー (修正版)
@@ -20,7 +21,15 @@ CSV_HEADER = [
     'hour', 'min', 'sec', 'cs',
     'gps_updated',
     'q0', 'q1', 'q2', 'q3',  # クォータニオン
-    'roll', 'pitch', 'yaw'   # オイラー角 [rad]
+    'roll', 'pitch', 'yaw',   # オイラー角 [rad]
+    'servo1_angle', 'servo2_angle',  # サーボ角度 [deg]
+    'q_err_x', 'q_err_y', 'q_err_z',  # 誤差クォータニオン
+    'accelTrust_value',  # 加速度補正信頼度 [0.0-1.0]
+    'control_enabled',  # 制御有効フラグ
+    'integrated_altitude',  # 積分高度 [m]
+    'integrated_vz',  # 積分速度 [m/s]
+    'az_freefall',  # Z軸自由落下加速度 [m/s²]
+    'launch_detected'  # 発射検出フラグ
 ]
 
 IN_FILE = 'fulldata.bin'

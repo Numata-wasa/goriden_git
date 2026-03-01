@@ -235,10 +235,10 @@ int8_t BMI2_BMM1_Class::bmi2_accel_set_config(struct bmi2_dev *bmi2_dev)
     if (rslt == BMI2_OK)
     {
 
-      config.cfg.acc.odr = BMI2_ACC_ODR_25HZ;
+      config.cfg.acc.odr = BMI2_ACC_ODR_200HZ;
 
       /* Gravity range of the sensor (+/- 2G, 4G, 8G, 16G). */
-      config.cfg.acc.range = BMI2_ACC_RANGE_2G;
+      config.cfg.acc.range = BMI2_ACC_RANGE_16G;
       config.cfg.acc.bwp = BMI2_ACC_NORMAL_AVG4;
       config.cfg.acc.filter_perf = BMI2_PERF_OPT_MODE;
 
@@ -284,8 +284,8 @@ int8_t BMI2_BMM1_Class::bmi2_gyro_set_config(struct bmi2_dev *bmi2_dev)
         if (rslt == BMI2_OK)
         {
             /* The user can change the following configuration parameter according to their requirement */
-            /* Output data Rate. By default ODR is set as 200Hz for gyro */
-            config.cfg.gyr.odr = BMI2_GYR_ODR_25HZ;
+            /* Output data Rate: 200Hz */
+            config.cfg.gyr.odr = BMI2_GYR_ODR_200HZ;
             /* Gyroscope Angular Rate Measurement Range.By default the range is 2000dps */
             config.cfg.gyr.range = BMI2_GYR_RANGE_2000;
             config.cfg.gyr.bwp = BMI2_GYR_NORMAL_MODE;

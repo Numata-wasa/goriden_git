@@ -47,29 +47,55 @@ bool bmeAvailable = false;  // BME280が正常に初期化されたかのフラ�
 bool bmi270Available = false;  // BMI270が正常に初期化されたかのフラグ
 // ==============
 
-// ===== サーボ制御 (ESP32 LEDC PWM) =====
-#define SERVO_PIN_1 5         // サーボ1のピン
-#define SERVO_PIN_2 4         // サーボ2のピン
-#define SERVO_PWM_CHANNEL_1 0 // LEDC チャネル1
-#define SERVO_PWM_CHANNEL_2 1 // LEDC チャネル2
-#define SERVO_PWM_FREQ 50     // 50Hz (サーボ標準)
-#define SERVO_PWM_BITS 16     // 16bit resolution
-#define SERVO_CENTER_US 1500  // サーボ中央値 [μs]
-#define SERVO_RANGE_US 500    // ±範囲 [μs] (1000-2000μs対応)
+// ===== サーボ制御 (Raw LEDC PWM) =====
+#define SERVO_PIN_1 4         // サーボ1のピン
+#define SERVO_PIN_2 5         // サーボ2のピン
 #define SERVO_UPDATE_FREQ 20  // サーボ更新頻度 [Hz]
 
-// ===== 姿勢制御 PID パラメータ =====
-const float target_roll  = 0.0f;         // 目標ロール [rad]
-const float target_pitch = -PI / 2.0f;   // 目標ピッチ [rad] (-90度)
-const float target_yaw   = 0.0f;         // 目標ヨー [rad]
+// LEDC PWM 設定
+#define SERVO1_LEDC_CH 2      // LEDCチャネル2
+#define SERVO2_LEDC_CH 3      // LEDCチャネル3
+#define SERVO_FREQ     50     // サーボPWM周波数 50Hz
+#define SERVO_RES_BITS 14     // 14bit分解能 (0-16383)
+#define SERVO_MIN_US   500    // 0°のパルス幅 [us]
+#define SERVO_MAX_US   2400   // 180°のパルス幅 [us]
 
-const float Kp_roll  = 200.0f;  // ロール比例ゲイン
-const float Ki_roll  = 10.0f;   // ロール積分ゲイン
-const float Kd_roll  = 50.0f;   // ロール微分ゲイン
+// 角度 -> LEDC duty変換ヘルパー
+void servoWriteAngle(uint8_t channel, int angle) {
+  angle = constrain(angle, 0, 180);
+  // 14bit: 16384 steps, 50Hz = 20000us period
+  // duty = pulseUs * 16384 / 20000
+  uint32_t pulseUs = map(angle, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
+  uint32_t duty = (pulseUs * 16384UL) / 20000UL;
+  ledcWrite(channel, duty);
+}
 
-const float Kp_pitch = 200.0f;  // ピッチ比例ゲイン
-const float Ki_pitch = 10.0f;   // ピッチ積分ゲイン
-const float Kd_pitch = 50.0f;   // ピッチ微分ゲイン
+// ===== 姿勢制御 目標クォータニオン =====
+// 目標: Quat:(0.1829, -0.7056, -0.1778, -0.6611)
+const float q0_target = 0.1829f;
+const float q1_target = -0.7056f;
+const float q2_target = -0.1778f;
+const float q3_target = -0.6611f;
+
+const float Kp_roll  = 1.0f;   // ロール比例ゲイン（飽和抑制のため低減）
+const float Ki_roll  = 0.0f;   // ロール積分ゲイン (P制御のみなので0)
+const float Kd_roll  = 0.32f;  // ロール微分ゲイン（飽和抑制のため低減）
+
+const float Kp_pitch = 1.2f;   // ピッチ比例ゲイン
+const float Ki_pitch = 0.0f;   // ピッチ積分ゲイン
+const float Kd_pitch = 0.4f;   // ピッチ微分ゲイン
+
+const float ERROR_DEADBAND = 0.03f;      // 小誤差デッドバンド
+const float SERVO_MAX_STEP_DEG = 8.0f;   // 1周期での最大角度変化 [deg]
+const float DTERM_DT_MAX = 0.12f;        // これ以上のdtではD項を無効化 [s]
+const float ACCEL_TRUST_MIN = 0.15f;     // accelTrust下限（ドリフト対策）
+const float LAUNCH_DETECT_ACC = 15.0f;   // 発射判定の加速度閾値 [m/s^2]
+const float CONTROL_ENABLE_ALT = 1.0f;   // 制御開始高度 [m]（地上試験用）
+const float VERTICAL_BIAS_ALPHA = 0.01f; // 待機中の鉛直軸バイアス学習率
+const float PRELAUNCH_STATIC_ACC_TOL = 2.0f; // 待機判定の|accNorm-1g|許容[m/s^2]
+const float PRELAUNCH_STATIC_GYRO_TOL = 30.0f; // 待機判定の角速度許容[deg/s]
+const float ZUPT_VEL_DAMP = 0.85f; // 静止判定時の速度減衰係数
+const float ZUPT_VEL_EPS = 0.08f;  // 静止判定時に0へ丸める速度閾値 [m/s]
 
 // PID制御用構造体
 struct PIDController {
@@ -80,13 +106,17 @@ struct PIDController {
 volatile float servo_cmd_roll = 0.0f;   // ロール制御コマンド [-1, 1]
 volatile float servo_cmd_pitch = 0.0f;  // ピッチ制御コマンド [-1, 1]
 PIDController pid_roll, pid_pitch;      // PIDコントローラ
+volatile float gy_ref = 0.0f;           // 初期キャリブレーション時の gy_body 値
+volatile bool servo_calibrated = false; // キャリブレーション完了フラグ
+volatile float servo1_shared = 90.0f;   // サーボ1の角度（sdWriteTaskで読み取り用）
+volatile float servo2_shared = 90.0f;   // サーボ2の角度（sdWriteTaskで読み取り用）
 // ==============
 
 // ===== BMI270 + BMM150 (Library) =====
 BMI2_BMM1_Class imuSensor;  // BMI2_BMM1ライブラリのインスタンス（名前を変更）
 
 // スケール係数（ライブラリから得られる生データを物理値に変換）
-#define ACC_SCALE_2G (1.0f / 16384.0f)        // ±2g設定時の加速度スケール [g]
+#define ACC_SCALE_16G (1.0f / 2048.0f)        // ±16g設定時の加速度スケール [g]
 #define GYRO_SCALE_2000DPS (1.0f / 16.4f)     // ±2000dps設定時のジャイロスケール [deg/s]
 #define MAG_SCALE (0.3f)                       // 磁気スケール [uT]
 const float G_TO_MS2 = 9.80665f;               // gからm/s^2への変換係数
@@ -111,6 +141,14 @@ struct LogEntry {
   uint8_t  gps_updated; // GPS座標が更新されたかのフラグ
   float q0, q1, q2, q3; // クォータニオン (q0 = スカラー部)
   float roll, pitch, yaw; // オイラー角 [rad]
+  float servo1_angle, servo2_angle; // サーボ角度 [deg]
+  float q_err_x, q_err_y, q_err_z; // 誤差クォータニオン要素
+  float accelTrust_value; // 加速度信頼度 [0.0-1.0]
+  uint8_t control_enabled; // 制御有効フラグ
+  float integrated_altitude; // 積分高度 [m]
+  float integrated_vz; // 鉛直軸速度 [m/s]（現設定: x軸）
+  float az_freefall; // 鉛直軸加速度（重力補正後）[m/s^2]（現設定: x軸）
+  uint8_t launch_detected; // 発射検知フラグ
 };
 #pragma pack(pop)
 
@@ -152,8 +190,26 @@ unsigned long ledStateChangeTime = 0;
 const long blinkOnDuration = 50;  // 1回の点灯時間 (ミリ秒)
 const long blinkOffDuration = 40; // 点滅と点滅の間の消灯時間 (ミリ秒)
 
+// ★★★ ログ用：誤差Q値と accelTrust 値 ★★★
+volatile float log_q_err_x = 0.0f;
+volatile float log_q_err_y = 0.0f;
+volatile float log_q_err_z = 0.0f;
+volatile float log_accelTrust = 0.0f;
+// =============""
 
-//================================================================
+// ★★★ 発射・制御フラグ ★★★
+volatile bool launchDetected = false;  // 発射を検知したか
+volatile bool controlEnabled = false;  // 制御を有効にするか（高度1m以上）
+volatile float launchAltitude = 0.0f; // 発射時の高度
+
+// ★★★ 加速度積分による高度計算 ★★★
+volatile float integrated_vz = 0.0f;      // 鉛直軸速度 [m/s]（現設定: x軸）
+volatile float integrated_altitude = 0.0f; // 統合高度 [m]
+volatile uint32_t last_integration_time = 0; // 前フレームのタイムスタンプ [ms]
+volatile float last_az_freefall = 0.0f;   // 鉛直軸加速度（重力補正後）[m/s^2]（現設定: x軸）
+volatile float vertical_acc_bias = G_TO_MS2; // 鉛直軸の重力・オフセット推定値（地上座標Z軸）
+volatile bool vertical_bias_initialized = false;
+// =============="
 // ★★★ サーボ制御補助関数 ★★★
 //================================================================
 // ヘルパー関数: 角度誤差を[-pi, pi]に正規化
@@ -183,19 +239,6 @@ void calculatePIDControl(float error, PIDController &pid, float Kp, float Ki, fl
   output = fmaxf(-1.0f, fminf(1.0f, output));
 }
 
-// ヘルパー関数: サーボピンをPWM制御
-void setServoUS(int channel, float cmd) {
-  // cmd: [-1, 1]
-  // 出力範囲: 1000-2000 μs (中央1500)
-  int pulse_width = (int)(SERVO_CENTER_US + cmd * SERVO_RANGE_US);
-  // PWM周期に対応するduty cycle を計算: 50Hz = 20000μs周期
-  // 各周期 = 20000μs / 2^16 ≈ 0.305μs
-  // duty = pulse_width / 20000 * 2^16
-  int duty = (int)(pulse_width * 65536 / 20000);
-  duty = fmaxf(0, fminf(65535, duty));
-  ledcWrite(channel, duty);
-}
-
 //================================================================
 // ★★★ BMI270 初期化関数（ライブラリ使用） ★★★
 //================================================================
@@ -215,48 +258,7 @@ bool bmi270setup(){
 //================================================================
 // ★ Task D (Core 0, Prio 1): クォータニオン計算 (相補フィルタ)
 //================================================================
-// ヘルパー関数: 角度誤差を[-pi, pi]に正規化
-float wrapAngleError(float error) {
-  while (error > PI) error -= 2 * PI;
-  while (error < -PI) error += 2 * PI;
-  return error;
-}
-
-// ヘルパー関数: PID制御でサーボ出力を計算
-void calculatePIDControl(float error, PIDController &pid, float Kp, float Ki, float Kd, float dt, float &output) {
-  // 誤差を正規化
-  error = wrapAngleError(error);
-  
-  // 積分項を更新
-  pid.error_integral += error * dt;
-  // 積分項の飽和防止 [-1, 1]
-  pid.error_integral = fmaxf(-1.0f, fminf(1.0f, pid.error_integral));
-  
-  // 微分項
-  float error_derivative = (error - pid.prev_error) / dt;
-  pid.prev_error = error;
-  
-  // PID出力
-  output = Kp * error + Ki * pid.error_integral + Kd * error_derivative;
-  // 出力を[-1, 1]に制限
-  output = fmaxf(-1.0f, fminf(1.0f, output));
-}
-
-// ヘルパー関数: サーボピンをセット
-void setServoUS(int pin, int channel, float cmd) {
-  // cmd: [-1, 1]
-  // 出力範囲: 1000-2000 μs (中心1500)
-  int pulse_width = (int)(SERVO_CENTER_US + cmd * SERVO_RANGE_US);
-  // PWM周期に対応するduty cycleを計算: 50Hz = 20000μs周期
-  // 各周期 = 20000μs / 2^16 ≈ 0.305μs
-  // duty = pulse_width / 20000 * 2^16
-  int duty = (int)(pulse_width * 65536 / 20000);
-  duty = fmaxf(0, fminf(65535, duty));
-  ledcWrite(channel, duty);
-}
-
-// ヘルパー関数: クォータニオン計算 (相補フィルタ
-
+// ヘルパー関数: 加速度からクォータニオンを算出
 void accelToQuaternion(float ax, float ay, float az, float &q0, float &q1, float &q2, float &q3) {
   float norm = sqrtf(ax * ax + ay * ay + az * az);
   if (norm == 0.0f) {
@@ -380,9 +382,17 @@ void eulerTask(void *pvParameters) {
   Serial.println("Quaternion Task started on Core 0 (Prio 1)");
 
   float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;  // 単位クォータニオンで初期化
-  const float alpha = 0.98f;  // 相補フィルタ係数 (ジャイロ信頼度)
+  const float alphaMin = 0.98f;   // 通常時の相補フィルタ係数 (ジャイロ信頼度)
+  const float alphaMax = 1.00f;   // 危険区間では加速度補正を無効化
+  const float gravity = 9.80665f; // [m/s^2]
+  const float accRejectLow = 0.70f * gravity;   // 慣性飛行(0g近傍)などで補正を切る下限
+  const float accRejectHigh = 1.30f * gravity;  // 推力加速などで補正を切る上限
+  const float gyroRejectDps = 220.0f;           // 高角速度時は加速度補正を切る
+  const float trustRise = 0.08f;   // 信頼度を上げる速度
+  const float trustFall = 0.30f;   // 信頼度を下げる速度(早めに遮断)
   uint32_t lastTime = 0;
   bool initialized = false;
+  float accelTrust = 1.0f; // 0.0=加速度補正なし(gyroのみ), 1.0=通常補正
   IMUData imu;
 
   for (;;) {
@@ -397,6 +407,26 @@ void eulerTask(void *pvParameters) {
         float dt = (imu.timestamp - lastTime) / 1000.0f; // 秒
         lastTime = imu.timestamp;
         if (dt <= 0.0f || dt > 0.5f) continue; // 異常な dt はスキップ
+
+        float accNorm = sqrtf(imu.ax * imu.ax + imu.ay * imu.ay + imu.az * imu.az);
+        float gyroAbsMax = fmaxf(fabsf(imu.gx), fmaxf(fabsf(imu.gy), fabsf(imu.gz)));
+
+        // ロケット推力中(>1g)・慣性飛行中(<1g, 特に0g近傍)・高角速度時は加速度補正を弱める
+        bool accelReliable = (accNorm >= accRejectLow) && (accNorm <= accRejectHigh) && (gyroAbsMax <= gyroRejectDps);
+        float targetTrust = accelReliable ? 1.0f : 0.0f;
+
+        // 急な切替で姿勢が跳ねないよう一次遅れで平滑化
+        if (targetTrust > accelTrust) {
+          accelTrust += trustRise;
+        } else {
+          accelTrust -= trustFall;
+        }
+        accelTrust = constrain(accelTrust, ACCEL_TRUST_MIN, 1.0f);  // 下限0.15でドリフト対策
+        
+        // ログ用に accelTrust を保存
+        log_accelTrust = accelTrust;
+
+        float alpha = alphaMax - (alphaMax - alphaMin) * accelTrust;
 
         // ジャイロでクォータニオンを更新
         float q0_gyro = q0, q1_gyro = q1, q2_gyro = q2, q3_gyro = q3;
@@ -426,53 +456,138 @@ void eulerTask(void *pvParameters) {
 }
 
 //================================================================
-// ★ Task F (Core 1, Prio 2): サーボ制御タスク (PID制御)
+// ★ Task F (Core 1, Prio 2): サーボ姿勢制御タスク (PID)
 //================================================================
 void servoControlTask(void *pvParameters) {
   Serial.println("Servo Control Task started on Core 1 (Prio 2)");
   
-  const TickType_t xFrequency = pdMS_TO_TICKS(1000 / SERVO_UPDATE_FREQ); // SERVO_UPDATE_FREQ Hz
+  const TickType_t xFrequency = pdMS_TO_TICKS(1000 / SERVO_UPDATE_FREQ);  // 50ms (20Hz)
   TickType_t xLastWakeTime = xTaskGetTickCount();
-  
-  // PIDコントローラを初期化
-  pid_roll.error_integral = 0.0f;
-  pid_roll.prev_error = 0.0f;
-  pid_pitch.error_integral = 0.0f;
-  pid_pitch.prev_error = 0.0f;
+  uint32_t prevControlMs = 0;
+  float servo1_cmd = 90.0f;
+  float servo2_cmd = 90.0f;
   
   for (;;) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    uint32_t nowMs = millis();
+    float dtControl = (prevControlMs == 0) ? (1.0f / SERVO_UPDATE_FREQ) : ((nowMs - prevControlMs) / 1000.0f);
+    prevControlMs = nowMs;
+    bool disableDterm = (dtControl <= 0.0f) || (dtControl > DTERM_DT_MAX);
     
-    // 現在のオイラー角を取得（最新ログエントリから読み込み）
-    portENTER_CRITICAL(&entryMux);
-    float current_roll = latestEntry.roll;
-    float current_pitch = latestEntry.pitch;
-    portEXIT_CRITICAL(&entryMux);
+    // 共有クォータニオンからオイラー角を計算
+    float q0 = sharedQ0, q1 = sharedQ1, q2 = sharedQ2, q3 = sharedQ3;
     
-    // 制御周期を計算
-    float dt = (float)xFrequency / 1000.0f; // 秒
+    // クォータニオンの妥当性チェック
+    float qnorm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+    if (isnan(qnorm) || qnorm < 0.1f) {
+      // 異常値 -> サーボを中央に固定
+      servoWriteAngle(SERVO1_LEDC_CH, 90);
+      servoWriteAngle(SERVO2_LEDC_CH, 90);
+      continue;
+    }
     
-    // 誤差を計算
-    float error_roll = current_roll - target_roll;
-    float error_pitch = current_pitch - target_pitch;
+    // ===== クォータニオン差分制御（ジンバルロック回避） =====
+    // 誤差クォータニオン = q_target^-1 * q_current
+    // q_target^-1 = (q0_target, -q1_target, -q2_target, -q3_target)
+    float q_err_w = q0_target*q0 + q1_target*q1 + q2_target*q2 + q3_target*q3;
+    float q_err_x = -q0_target*q1 + q1_target*q0 - q2_target*q3 + q3_target*q2;
+    float q_err_y = -q0_target*q2 + q1_target*q3 + q2_target*q0 - q3_target*q1;
+    float q_err_z = -q0_target*q3 - q1_target*q2 + q2_target*q1 + q3_target*q0;
     
-    // PID制御でサーボコマンドを計算
-    float cmd_roll = 0.0f, cmd_pitch = 0.0f;
-    calculatePIDControl(error_roll, pid_roll, Kp_roll, Ki_roll, Kd_roll, dt, cmd_roll);
-    calculatePIDControl(error_pitch, pid_pitch, Kp_pitch, Ki_pitch, Kd_pitch, dt, cmd_pitch);
+    // 誤差クォータニオンの正規化
+    float q_err_norm = sqrtf(q_err_w*q_err_w + q_err_x*q_err_x + q_err_y*q_err_y + q_err_z*q_err_z);
+    if (q_err_norm > 0.01f) {
+      q_err_w /= q_err_norm;
+      q_err_x /= q_err_norm;
+      q_err_y /= q_err_norm;
+      q_err_z /= q_err_norm;
+    }
     
-    // 共有変数に保存
-    servo_cmd_roll = cmd_roll;
-    servo_cmd_pitch = cmd_pitch;
+    // ログ用に誤差Q値を保存
+    log_q_err_x = q_err_x;
+    log_q_err_y = q_err_y;
+    log_q_err_z = q_err_z;
     
-    // サーボにPWM信号を出力
-    setServoUS(SERVO_PWM_CHANNEL_1, servo_cmd_roll);   // サーボ1
-    setServoUS(SERVO_PWM_CHANNEL_2, servo_cmd_pitch);  // サーボ2
+    // 回転軸（機体座標系）: (q_err_x, q_err_y, q_err_z) / sin(angle/2)
+    // 簡略化: 小さなアングル近似で誤差軸ベクトルを直接使用
+    float error_x = 2.0f * q_err_x;  // x軸周りの回転誤差（roll）
+    float error_y = 2.0f * q_err_y;  // y軸周りの回転誤差（pitch）
+
+    // 小誤差デッドバンド（微振動抑制）
+    if (fabsf(error_x) < ERROR_DEADBAND) error_x = 0.0f;
+    if (fabsf(error_y) < ERROR_DEADBAND) error_y = 0.0f;
     
-    // DebugSerialで制御状態を出力（オプション）
-    // Serial.printf("[Servo] Roll: %.2f->%.2f, cmd: %.2f | Pitch: %.2f->%.2f, cmd: %.2f\n",
-    //              current_roll, target_roll, servo_cmd_roll,
-    //              current_pitch, target_pitch, servo_cmd_pitch);
+    // PD制御
+    // ロール軸 (x軸)
+    float d_error_x = disableDterm ? 0.0f : (error_x - pid_roll.prev_error);
+    float output_x = Kp_roll * error_x + Kd_roll * d_error_x;
+    output_x = fmaxf(-1.0f, fminf(1.0f, output_x));
+    pid_roll.prev_error = error_x;
+    
+    // ピッチ軸 (y軸)
+    float d_error_y = disableDterm ? 0.0f : (error_y - pid_pitch.prev_error);
+    float output_y = Kp_pitch * error_y + Kd_pitch * d_error_y;
+    output_y = fmaxf(-1.0f, fminf(1.0f, output_y));
+    pid_pitch.prev_error = error_y;
+    
+    // サーボ目標角度
+    float servo1_target = 90.0f + 90.0f * output_x;
+    float servo2_target = 90.0f + 90.0f * output_y;
+    
+    // 高度1m以上で制御開始（地上では中央に固定）
+    if (latestEntry.alt < CONTROL_ENABLE_ALT) {
+      servo1_target = 90.0f;
+      servo2_target = 90.0f;
+      controlEnabled = false;
+    } else {
+      controlEnabled = true;
+    }
+
+    // スルーレート制限（急激な角度変化を抑制）
+    float delta1 = servo1_target - servo1_cmd;
+    if (delta1 > SERVO_MAX_STEP_DEG) delta1 = SERVO_MAX_STEP_DEG;
+    if (delta1 < -SERVO_MAX_STEP_DEG) delta1 = -SERVO_MAX_STEP_DEG;
+    servo1_cmd += delta1;
+
+    float delta2 = servo2_target - servo2_cmd;
+    if (delta2 > SERVO_MAX_STEP_DEG) delta2 = SERVO_MAX_STEP_DEG;
+    if (delta2 < -SERVO_MAX_STEP_DEG) delta2 = -SERVO_MAX_STEP_DEG;
+    servo2_cmd += delta2;
+
+    // サーボ角度
+    int servo1_angle = (int)servo1_cmd;
+    int servo2_angle = (int)servo2_cmd;
+    servo1_angle = constrain(servo1_angle, 0, 180);
+    servo2_angle = constrain(servo2_angle, 0, 180);
+    
+    servoWriteAngle(SERVO1_LEDC_CH, servo1_angle);
+    servoWriteAngle(SERVO2_LEDC_CH, servo2_angle);
+    
+    // サーボ角度を共有変数に保存（sdWriteTaskで読み取り）
+    servo1_shared = servo1_angle;
+    servo2_shared = servo2_angle;
+    
+    // デバッグ出力フルバージョン (1Hz, 誤差クォータニオン)
+    static int debugCount = 0;
+    if (++debugCount >= 20) {
+      debugCount = 0;
+      Serial.print("[QErr] curr=(");
+      Serial.print(q0, 3); Serial.print(",");
+      Serial.print(q1, 3); Serial.print(",");
+      Serial.print(q2, 3); Serial.print(",");
+      Serial.print(q3, 3); Serial.print(") ");
+      Serial.print("| q_err=(");
+      Serial.print(q_err_w, 3); Serial.print(",");
+      Serial.print(q_err_x, 3); Serial.print(",");
+      Serial.print(q_err_y, 3); Serial.print(",");
+      Serial.print(q_err_z, 3); Serial.print(") ");
+      Serial.print("| err_axis(x,y)=(");
+      Serial.print(error_x, 3); Serial.print(",");
+      Serial.print(error_y, 3); Serial.print(") ");
+      Serial.print("| s1="); Serial.print(servo1_angle);
+      Serial.print(" s2="); Serial.println(servo2_angle);
+    }
   }
 }
 
@@ -531,8 +646,20 @@ void sensorTask(void *pvParameters) {
       // BME280が利用できない場合は定数値を使用
       entry.temp = 25.0;   // 温度 25℃
       entry.pres = 1013.0; // 気圧 1013 hPa
-      entry.alt = 100.0;   // 高度 100m
+      entry.alt = 0.0;     // 高度は加速度積分で計算（後で上書き）
       entry.hum = 50.0;    // 湿度 50%
+    }
+    
+    // --- GPSデータ格納（高度は使用しない） ---
+    entry.lat = gps.location.isValid() ? (int32_t)(gps.location.lat() * 1e6) : 0;
+    entry.lng = gps.location.isValid() ? (int32_t)(gps.location.lng() * 1e6) : 0;
+    entry.gps_alt = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;  // ログには記録するが、制御には使わない
+    entry.sats = gps.satellites.isValid() ? (uint8_t)gps.satellites.value() : 0;
+    if (gps.date.isValid()) {
+      entry.date_year = gps.date.year(); entry.date_month = gps.date.month(); entry.date_day = gps.date.day();
+    }
+    if (gps.time.isValid()) {
+      entry.time_hour = gps.time.hour(); entry.time_min = gps.time.minute(); entry.time_sec = gps.time.second(); entry.time_cs = gps.time.centisecond();
     }
     
     if (bmi270Available) {
@@ -540,9 +667,9 @@ void sensorTask(void *pvParameters) {
       imuSensor.readGyroAccel(imu, true);  // true = 生データを取得
       
       // 加速度 [g] から [m/s^2] に変換
-      entry.ax = (imu.acc.x * ACC_SCALE_2G) * G_TO_MS2;
-      entry.ay = (imu.acc.y * ACC_SCALE_2G) * G_TO_MS2;
-      entry.az = (imu.acc.z * ACC_SCALE_2G) * G_TO_MS2;
+      entry.ax = (imu.acc.x * ACC_SCALE_16G) * G_TO_MS2;
+      entry.ay = (imu.acc.y * ACC_SCALE_16G) * G_TO_MS2;
+      entry.az = (imu.acc.z * ACC_SCALE_16G) * G_TO_MS2;
       
       // ジャイロ [deg/s]
       entry.gx = imu.gyr.x * GYRO_SCALE_2000DPS;
@@ -553,6 +680,90 @@ void sensorTask(void *pvParameters) {
       entry.cx = 0;
       entry.cy = 0;
       entry.cz = 0;
+      
+      // ★★★ 加速度積分による高度計算 ★★★
+      // （GPS高度は使わない、加速度直積分のみ）
+      if (last_integration_time == 0) {
+        // 初回：タイムスタンプのみ記録
+        last_integration_time = entry.timestamp;
+        last_az_freefall = 0.0f;
+      } else {
+        float dt = (entry.timestamp - last_integration_time) / 1000.0f; // [s]
+        if (dt > 0 && dt < 0.5f) {  // 異常な dt は無視
+          // クォータニオンで機体加速度を地上座標へ回し、鉛直成分(Z)を取得
+          float q0w = sharedQ0;
+          float q1w = sharedQ1;
+          float q2w = sharedQ2;
+          float q3w = sharedQ3;
+          float qnorm = sqrtf(q0w*q0w + q1w*q1w + q2w*q2w + q3w*q3w);
+          if (qnorm > 1e-6f) {
+            q0w /= qnorm;
+            q1w /= qnorm;
+            q2w /= qnorm;
+            q3w /= qnorm;
+          } else {
+            q0w = 1.0f; q1w = 0.0f; q2w = 0.0f; q3w = 0.0f;
+          }
+
+          float acc_world_z =
+              (2.0f * (q1w * q3w - q0w * q2w)) * entry.ax +
+              (2.0f * (q2w * q3w + q0w * q1w)) * entry.ay +
+              (1.0f - 2.0f * (q1w * q1w + q2w * q2w)) * entry.az;
+
+          // 待機中は静止状態のときだけ鉛直軸バイアスを学習（地上座標Z軸）
+          float accNorm = sqrtf(entry.ax * entry.ax + entry.ay * entry.ay + entry.az * entry.az);
+          float gyroAbsMax = fmaxf(fabsf(entry.gx), fmaxf(fabsf(entry.gy), fabsf(entry.gz)));
+          bool isStatic = (fabsf(accNorm - G_TO_MS2) < PRELAUNCH_STATIC_ACC_TOL) &&
+                          (gyroAbsMax < PRELAUNCH_STATIC_GYRO_TOL);
+
+          if (!launchDetected && isStatic) {
+            if (!vertical_bias_initialized) {
+              vertical_acc_bias = acc_world_z;
+              vertical_bias_initialized = true;
+            } else {
+              vertical_acc_bias = (1.0f - VERTICAL_BIAS_ALPHA) * vertical_acc_bias + VERTICAL_BIAS_ALPHA * acc_world_z;
+            }
+          }
+
+          // 鉛直軸（地上座標Z軸）加速度からバイアスを差し引く（上向きをプラス）
+          float vertical_freefall = acc_world_z - vertical_acc_bias;
+          last_az_freefall = vertical_freefall;  // ログ用に保存（フィールド名は互換維持）
+          
+          // 速度積分: v = v_prev + a * dt
+          integrated_vz += vertical_freefall * dt;
+
+          // 発射後に静止へ戻った区間では速度をゼロへ収束させる（ZUPT）
+          if (launchDetected && isStatic) {
+            integrated_vz *= ZUPT_VEL_DAMP;
+            if (fabsf(integrated_vz) < ZUPT_VEL_EPS) {
+              integrated_vz = 0.0f;
+            }
+          }
+          
+          // 高度積分: h = h_prev + v * dt + 0.5 * a * dt^2
+          integrated_altitude += integrated_vz * dt + 0.5f * vertical_freefall * dt * dt;
+        }
+        last_integration_time = entry.timestamp;
+      }
+      
+      // ★★★ 発射検知: 加速度ノルムが閾値を超えたら ★★★
+      if (!launchDetected) {
+        float accNorm = sqrtf(entry.ax*entry.ax + entry.ay*entry.ay + entry.az*entry.az);
+        if (accNorm >= LAUNCH_DETECT_ACC) {
+          launchDetected = true;
+          launchAltitude = integrated_altitude; // 発射時の積分高度を基準0にする
+          integrated_vz = 0.0f; // 発射前ドリフトの速度成分をリセット
+          Serial.println("[LAUNCH] Detected!");
+        }
+      }
+
+      // 計算した高度をエントリに設定（BME280がない場合）
+      // 地上待機中の積分ドリフト影響を避けるため、発射までは0固定
+      // 発射後は「発射時=0m」の相対高度を使う
+      if (!bmeAvailable) {
+        float relativeAlt = launchDetected ? (integrated_altitude - launchAltitude) : 0.0f;
+        entry.alt = fmaxf(0.0f, relativeAlt);
+      }
     } else {
       // BMI270が利用できない場合は0を使用
       entry.ax = 0.0;
@@ -592,6 +803,23 @@ void sensorTask(void *pvParameters) {
     
     // --- クォータニオンからオイラー角を計算 ---
     quaternionToEuler(entry.q0, entry.q1, entry.q2, entry.q3, entry.roll, entry.pitch, entry.yaw);
+    
+    // --- サーボ角度を記録 ---
+    entry.servo1_angle = servo1_shared;
+    entry.servo2_angle = servo2_shared;
+    
+    // --- ログ用：誤差Q値と accelTrust、制御フラグを記録 ---
+    entry.q_err_x = log_q_err_x;
+    entry.q_err_y = log_q_err_y;
+    entry.q_err_z = log_q_err_z;
+    entry.accelTrust_value = log_accelTrust;
+    entry.control_enabled = controlEnabled ? 1 : 0;
+    
+    // --- ログ用：積分高度、速度、加速度、発射フラグを記録 ---
+    entry.integrated_altitude = integrated_altitude;
+    entry.integrated_vz = integrated_vz;
+    entry.az_freefall = last_az_freefall;
+    entry.launch_detected = launchDetected ? 1 : 0;
 
     // --- シリアル表示タスク用に最新エントリをコピー ---
     portENTER_CRITICAL(&entryMux);
@@ -744,16 +972,16 @@ void setup() {
     Serial.print("LogEntry struct size: ");
     Serial.println(sizeof(LogEntry));
 
-    // --- LEDC PWM 初期化（サーボ制御用） ---
-    Serial.println("Initializing LEDC PWM for servo control...");
-    ledcSetup(SERVO_PWM_CHANNEL_1, SERVO_PWM_FREQ, SERVO_PWM_BITS);
-    ledcSetup(SERVO_PWM_CHANNEL_2, SERVO_PWM_FREQ, SERVO_PWM_BITS);
-    ledcAttachPin(SERVO_PIN_1, SERVO_PWM_CHANNEL_1);
-    ledcAttachPin(SERVO_PIN_2, SERVO_PWM_CHANNEL_2);
-    // サーボを中央値で初期化
-    setServoUS(SERVO_PWM_CHANNEL_1, 0.0f);
-    setServoUS(SERVO_PWM_CHANNEL_2, 0.0f);
-    Serial.println("LEDC PWM initialized.");
+    // --- LEDC PWM サーボ初期化 (SPI/SDの後に実行) ---
+    Serial.println("Initializing LEDC Servo...");
+    ledcSetup(SERVO1_LEDC_CH, SERVO_FREQ, SERVO_RES_BITS);
+    ledcSetup(SERVO2_LEDC_CH, SERVO_FREQ, SERVO_RES_BITS);
+    ledcAttachPin(SERVO_PIN_1, SERVO1_LEDC_CH);
+    ledcAttachPin(SERVO_PIN_2, SERVO2_LEDC_CH);
+    servoWriteAngle(SERVO1_LEDC_CH, 90);  // 中央
+    servoWriteAngle(SERVO2_LEDC_CH, 90);  // 中央
+    Serial.println("LEDC Servo initialized.");
+    Serial.println("[Servo] Waiting for calibration... Keep horizontal for 5 seconds!");
 
     // --- タスクとキューの作成 ---
     xQueue = xQueueCreate(QUEUE_LENGTH, sizeof(LogEntry));
@@ -769,12 +997,13 @@ void setup() {
       while(1);
     }
 
-    xTaskCreatePinnedToCore(sdWriteTask,     "SDWriteTask",    4096, NULL, 1, &hSdWriteTask,    1);
-    xTaskCreatePinnedToCore(sdFlushTask,     "SDFlushTask",    2048, NULL, 0, &hSdFlushTask,    1);
-    xTaskCreatePinnedToCore(serialPrintTask, "SerialPrint",    4096, NULL, 0, &hSerialPrintTask,1);
-    xTaskCreatePinnedToCore(servoControlTask,"ServoControl",   2048, NULL, 2, NULL,             1);  // サーボ制御タスク
-    xTaskCreatePinnedToCore(eulerTask,       "EulerTask",      4096, NULL, 1, &hEulerTask,      0);
-    xTaskCreatePinnedToCore(sensorTask,      "SensorTask",     4096, NULL, 2, &hSensorTask,     0);
+    // --- 全タスク起動 ---
+    xTaskCreatePinnedToCore(sdWriteTask,      "SDWriteTask",    4096, NULL, 1, &hSdWriteTask,     1);
+    xTaskCreatePinnedToCore(sdFlushTask,      "SDFlushTask",    2048, NULL, 0, &hSdFlushTask,     1);
+    xTaskCreatePinnedToCore(serialPrintTask,  "SerialPrint",    4096, NULL, 0, &hSerialPrintTask, 1);
+    xTaskCreatePinnedToCore(servoControlTask, "ServoControl",   4096, NULL, 2, NULL,              1);
+    xTaskCreatePinnedToCore(eulerTask,        "EulerTask",      4096, NULL, 1, &hEulerTask,       0);
+    xTaskCreatePinnedToCore(sensorTask,       "SensorTask",     4096, NULL, 2, &hSensorTask,      0);
 }
 
 //================================================================
