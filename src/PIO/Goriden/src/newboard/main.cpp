@@ -50,7 +50,7 @@ bool bmi270Available = false;  // BMI270が正常に初期化されたかのフ�
 // ===== サーボ制御 (Raw LEDC PWM) =====
 #define SERVO_PIN_1 4         // サーボ1のピン
 #define SERVO_PIN_2 5         // サーボ2のピン
-#define SERVO_UPDATE_FREQ 20  // サーボ更新頻度 [Hz]
+#define SERVO_UPDATE_FREQ 50  // サーボ更新頻度 [Hz]
 
 // LEDC PWM 設定
 #define SERVO1_LEDC_CH 2      // LEDCチャネル2
@@ -59,6 +59,11 @@ bool bmi270Available = false;  // BMI270が正常に初期化されたかのフ�
 #define SERVO_RES_BITS 14     // 14bit分解能 (0-16383)
 #define SERVO_MIN_US   500    // 0°のパルス幅 [us]
 #define SERVO_MAX_US   2400   // 180°のパルス幅 [us]
+
+const int SERVO_NEUTRAL_ANGLE = 90;      // 中立角 [deg]
+const int SERVO_MAX_DEFLECTION_DEG = 7;  // 最大舵角 ±[deg]
+const int SERVO1_DIR = -1;               // サーボ1の正負（逆なら -1）
+const int SERVO2_DIR = +1;               // サーボ2の正負（逆なら -1）
 
 // 角度 -> LEDC duty変換ヘルパー
 void servoWriteAngle(uint8_t channel, int angle) {
@@ -71,26 +76,27 @@ void servoWriteAngle(uint8_t channel, int angle) {
 }
 
 // ===== 姿勢制御 目標クォータニオン =====
-// 目標: Quat:(0.1829, -0.7056, -0.1778, -0.6611)
-const float q0_target = 0.1829f;
-const float q1_target = -0.7056f;
-const float q2_target = -0.1778f;
-const float q3_target = -0.6611f;
+// 目標: オイラー角 pitch=-π/2, roll=0, yaw=0
+// クォータニオン: q=(cos(-π/4), 0, sin(-π/4), 0)
+const float q0_target = 0.7071f;
+const float q1_target = 0.0000f;
+const float q2_target = -0.7071f;
+const float q3_target = 0.0000f;
 
-const float Kp_roll  = 1.0f;   // ロール比例ゲイン（飽和抑制のため低減）
+const float Kp_roll  = 1.3f;   // ロール比例ゲイン
 const float Ki_roll  = 0.0f;   // ロール積分ゲイン (P制御のみなので0)
-const float Kd_roll  = 0.32f;  // ロール微分ゲイン（飽和抑制のため低減）
+const float Kd_roll  = 0.35f;  // ロール微分ゲイン
 
-const float Kp_pitch = 1.2f;   // ピッチ比例ゲイン
+const float Kp_pitch = 1.5f;   // ピッチ比例ゲイン
 const float Ki_pitch = 0.0f;   // ピッチ積分ゲイン
-const float Kd_pitch = 0.4f;   // ピッチ微分ゲイン
+const float Kd_pitch = 0.45f;  // ピッチ微分ゲイン
 
-const float ERROR_DEADBAND = 0.03f;      // 小誤差デッドバンド
-const float SERVO_MAX_STEP_DEG = 8.0f;   // 1周期での最大角度変化 [deg]
+const float ERROR_DEADBAND = 0.01f;      // 小誤差デッドバンド
+const float SERVO_MAX_STEP_DEG = 15.0f;  // 1周期での最大角度変化 [deg]
 const float DTERM_DT_MAX = 0.12f;        // これ以上のdtではD項を無効化 [s]
 const float ACCEL_TRUST_MIN = 0.15f;     // accelTrust下限（ドリフト対策）
-const float LAUNCH_DETECT_ACC = 15.0f;   // 発射判定の加速度閾値 [m/s^2]
-const float CONTROL_ENABLE_ALT = 1.0f;   // 制御開始高度 [m]（地上試験用）
+const float LAUNCH_DETECT_ACC = 35.0f;   // 発射判定の加速度閾値 [m/s^2]（≈4g）
+
 const float VERTICAL_BIAS_ALPHA = 0.01f; // 待機中の鉛直軸バイアス学習率
 const float PRELAUNCH_STATIC_ACC_TOL = 2.0f; // 待機判定の|accNorm-1g|許容[m/s^2]
 const float PRELAUNCH_STATIC_GYRO_TOL = 30.0f; // 待機判定の角速度許容[deg/s]
@@ -199,8 +205,9 @@ volatile float log_accelTrust = 0.0f;
 
 // ★★★ 発射・制御フラグ ★★★
 volatile bool launchDetected = false;  // 発射を検知したか
-volatile bool controlEnabled = false;  // 制御を有効にするか（高度1m以上）
+volatile bool controlEnabled = false;  // 制御を有効にするか（発射検知から2秒後）
 volatile float launchAltitude = 0.0f; // 発射時の高度
+volatile uint32_t launchDetectionTime = 0; // 発射検知時刻 [ms]
 
 // ★★★ 加速度積分による高度計算 ★★★
 volatile float integrated_vz = 0.0f;      // 鉛直軸速度 [m/s]（現設定: x軸）
@@ -244,13 +251,37 @@ void calculatePIDControl(float error, PIDController &pid, float Kp, float Ki, fl
 //================================================================
 bool bmi270setup(){
   Serial.println("Initializing BMI270+BMM150 with Library...");
+  Serial.println("[IMU] Calling imuSensor.begin()...");
   
   if (!imuSensor.begin(&Serial)) {
-    Serial.println("!!! WARNING: IMU initialization failed!");
+    Serial.println("!!! ERROR: IMU initialization failed!");
+    Serial.println("[IMU] Check: I2C connection, sensor address, Wire setup");
     return false;
   }
   
-  Serial.println("BMI270+BMM150 initialized successfully.");
+  Serial.println("[IMU] SUCCESS: BMI270+BMM150 initialized.");
+  
+  // テスト読み込み
+  Serial.println("[IMU] Performing test read (5 times with separate reads)...");
+  for (int i = 0; i < 5; i++) {
+    struct bmi2_sens_data test_imu;
+    int testResult = imuSensor.readGyroAccel(test_imu, true);
+    Serial.printf("[Test %d-combined] result=%d | acc=(%6d,%6d,%6d) gyr=(%6d,%6d,%6d)\n",
+      i, testResult,
+      test_imu.acc.x, test_imu.acc.y, test_imu.acc.z,
+      test_imu.gyr.x, test_imu.gyr.y, test_imu.gyr.z);
+    
+    // 個別読み込みのテスト
+    float ax, ay, az;
+    float gx, gy, gz;
+    imuSensor.readAcceleration(ax, ay, az);
+    imuSensor.readGyroscope(gx, gy, gz);
+    Serial.printf("[Test %d-separate] acc_float=(%.4f,%.4f,%.4f) gyr_float=(%.4f,%.4f,%.4f)\n",
+      i, ax, ay, az, gx, gy, gz);
+    
+    delay(100);
+  }
+  
   return true;
 }
 
@@ -464,8 +495,8 @@ void servoControlTask(void *pvParameters) {
   const TickType_t xFrequency = pdMS_TO_TICKS(1000 / SERVO_UPDATE_FREQ);  // 50ms (20Hz)
   TickType_t xLastWakeTime = xTaskGetTickCount();
   uint32_t prevControlMs = 0;
-  float servo1_cmd = 90.0f;
-  float servo2_cmd = 90.0f;
+  float servo1_cmd = (float)SERVO_NEUTRAL_ANGLE;
+  float servo2_cmd = (float)SERVO_NEUTRAL_ANGLE;
   
   for (;;) {
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -482,8 +513,8 @@ void servoControlTask(void *pvParameters) {
     float qnorm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
     if (isnan(qnorm) || qnorm < 0.1f) {
       // 異常値 -> サーボを中央に固定
-      servoWriteAngle(SERVO1_LEDC_CH, 90);
-      servoWriteAngle(SERVO2_LEDC_CH, 90);
+      servoWriteAngle(SERVO1_LEDC_CH, SERVO_NEUTRAL_ANGLE);
+      servoWriteAngle(SERVO2_LEDC_CH, SERVO_NEUTRAL_ANGLE);
       continue;
     }
     
@@ -531,14 +562,18 @@ void servoControlTask(void *pvParameters) {
     output_y = fmaxf(-1.0f, fminf(1.0f, output_y));
     pid_pitch.prev_error = error_y;
     
-    // サーボ目標角度
-    float servo1_target = 90.0f + 90.0f * output_x;
-    float servo2_target = 90.0f + 90.0f * output_y;
+    // サーボ目標角度（各軸1サーボ、符号は SERVOx_DIR で切替）
+    float servo1_target = (float)SERVO_NEUTRAL_ANGLE + (float)SERVO1_DIR * ((float)SERVO_MAX_DEFLECTION_DEG * output_x);
+    float servo2_target = (float)SERVO_NEUTRAL_ANGLE + (float)SERVO2_DIR * ((float)SERVO_MAX_DEFLECTION_DEG * output_y);
     
-    // 高度1m以上で制御開始（地上では中央に固定）
-    if (latestEntry.alt < CONTROL_ENABLE_ALT) {
-      servo1_target = 90.0f;
-      servo2_target = 90.0f;
+    // 発射検知から1.5秒以上経過で制御開始
+    uint32_t currentTime = millis();
+    uint32_t timeSinceLaunch = launchDetected ? (currentTime - launchDetectionTime) : 0;
+    const uint32_t CONTROL_DELAY_MS = 1500; // 2秒の遅延
+    
+    if (timeSinceLaunch < CONTROL_DELAY_MS) {
+      servo1_target = (float)SERVO_NEUTRAL_ANGLE;
+      servo2_target = (float)SERVO_NEUTRAL_ANGLE;
       controlEnabled = false;
     } else {
       controlEnabled = true;
@@ -555,11 +590,13 @@ void servoControlTask(void *pvParameters) {
     if (delta2 < -SERVO_MAX_STEP_DEG) delta2 = -SERVO_MAX_STEP_DEG;
     servo2_cmd += delta2;
 
-    // サーボ角度
+    // サーボ角度（最大舵角に制限）
     int servo1_angle = (int)servo1_cmd;
     int servo2_angle = (int)servo2_cmd;
-    servo1_angle = constrain(servo1_angle, 0, 180);
-    servo2_angle = constrain(servo2_angle, 0, 180);
+    const int SERVO_MAX_ANGLE = SERVO_NEUTRAL_ANGLE + SERVO_MAX_DEFLECTION_DEG;
+    const int SERVO_MIN_ANGLE = SERVO_NEUTRAL_ANGLE - SERVO_MAX_DEFLECTION_DEG;
+    servo1_angle = constrain(servo1_angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+    servo2_angle = constrain(servo2_angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
     
     servoWriteAngle(SERVO1_LEDC_CH, servo1_angle);
     servoWriteAngle(SERVO2_LEDC_CH, servo2_angle);
@@ -585,6 +622,12 @@ void servoControlTask(void *pvParameters) {
       Serial.print("| err_axis(x,y)=(");
       Serial.print(error_x, 3); Serial.print(",");
       Serial.print(error_y, 3); Serial.print(") ");
+      Serial.print("| out(x,y)=(");
+      Serial.print(output_x, 3); Serial.print(",");
+      Serial.print(output_y, 3); Serial.print(") ");
+      Serial.print("| tgt(s1,s2)=(");
+      Serial.print(servo1_target, 1); Serial.print(",");
+      Serial.print(servo2_target, 1); Serial.print(") ");
       Serial.print("| s1="); Serial.print(servo1_angle);
       Serial.print(" s2="); Serial.println(servo2_angle);
     }
@@ -664,7 +707,11 @@ void sensorTask(void *pvParameters) {
     
     if (bmi270Available) {
       // ★★★ ライブラリを使用してデータ取得 ★★★
-      imuSensor.readGyroAccel(imu, true);  // true = 生データを取得
+      int readResult = imuSensor.readGyroAccel(imu, true);  // true = 生データを取得
+      
+      if (readResult != 0) {
+        Serial.printf("[IMU ERROR] readGyroAccel failed with code: %d\n", readResult);
+      }
       
       // 加速度 [g] から [m/s^2] に変換
       entry.ax = (imu.acc.x * ACC_SCALE_16G) * G_TO_MS2;
@@ -675,6 +722,15 @@ void sensorTask(void *pvParameters) {
       entry.gx = imu.gyr.x * GYRO_SCALE_2000DPS;
       entry.gy = imu.gyr.y * GYRO_SCALE_2000DPS;
       entry.gz = imu.gyr.z * GYRO_SCALE_2000DPS;
+      
+      // デバッグ: 詳細なデータをシリアルに出力（100フレームごと）
+      static int imuDebugCount = 0;
+      if (++imuDebugCount % 100 == 0) {
+        Serial.printf("[IMU Data] raw_acc=(%6d,%6d,%6d) raw_gyr=(%6d,%6d,%6d)\n",
+          imu.acc.x, imu.acc.y, imu.acc.z, imu.gyr.x, imu.gyr.y, imu.gyr.z);
+        Serial.printf("[IMU Conv] ax=%.2f ay=%.2f az=%.2f | gx=%.2f gy=%.2f gz=%.2f\n",
+          entry.ax, entry.ay, entry.az, entry.gx, entry.gy, entry.gz);
+      }
       
       // 地磁気センサを無視するため0固定
       entry.cx = 0;
@@ -751,6 +807,7 @@ void sensorTask(void *pvParameters) {
         float accNorm = sqrtf(entry.ax*entry.ax + entry.ay*entry.ay + entry.az*entry.az);
         if (accNorm >= LAUNCH_DETECT_ACC) {
           launchDetected = true;
+          launchDetectionTime = millis(); // 発射検知時刻を記録
           launchAltitude = integrated_altitude; // 発射時の積分高度を基準0にする
           integrated_vz = 0.0f; // 発射前ドリフトの速度成分をリセット
           Serial.println("[LAUNCH] Detected!");
@@ -978,8 +1035,38 @@ void setup() {
     ledcSetup(SERVO2_LEDC_CH, SERVO_FREQ, SERVO_RES_BITS);
     ledcAttachPin(SERVO_PIN_1, SERVO1_LEDC_CH);
     ledcAttachPin(SERVO_PIN_2, SERVO2_LEDC_CH);
-    servoWriteAngle(SERVO1_LEDC_CH, 90);  // 中央
-    servoWriteAngle(SERVO2_LEDC_CH, 90);  // 中央
+    servoWriteAngle(SERVO1_LEDC_CH, SERVO_NEUTRAL_ANGLE);  // 中央
+    servoWriteAngle(SERVO2_LEDC_CH, SERVO_NEUTRAL_ANGLE);  // 中央
+    
+    // サーボ初期化確認シーケンス（個別テスト）
+    Serial.println("[Servo] Calibration sequence starting...");
+    const int SERVO_MIN_ANGLE = SERVO_NEUTRAL_ANGLE - SERVO_MAX_DEFLECTION_DEG;
+    const int SERVO_MAX_ANGLE = SERVO_NEUTRAL_ANGLE + SERVO_MAX_DEFLECTION_DEG;
+
+    // サーボ1 単体テスト
+    Serial.println("[Servo Test] Servo1 only");
+    delay(500);
+    servoWriteAngle(SERVO1_LEDC_CH, SERVO_MIN_ANGLE);  // 最小舵角
+    servoWriteAngle(SERVO2_LEDC_CH, SERVO_NEUTRAL_ANGLE);
+    delay(500);
+    servoWriteAngle(SERVO1_LEDC_CH, SERVO_MAX_ANGLE); // 最大舵角
+    servoWriteAngle(SERVO2_LEDC_CH, SERVO_NEUTRAL_ANGLE);
+    delay(500);
+
+    // サーボ2 単体テスト
+    Serial.println("[Servo Test] Servo2 only");
+    servoWriteAngle(SERVO1_LEDC_CH, SERVO_NEUTRAL_ANGLE);
+    servoWriteAngle(SERVO2_LEDC_CH, SERVO_MIN_ANGLE);
+    delay(500);
+    servoWriteAngle(SERVO1_LEDC_CH, SERVO_NEUTRAL_ANGLE);
+    servoWriteAngle(SERVO2_LEDC_CH, SERVO_MAX_ANGLE);
+    delay(500);
+
+    servoWriteAngle(SERVO1_LEDC_CH, SERVO_NEUTRAL_ANGLE);  // センターに戻す
+    servoWriteAngle(SERVO2_LEDC_CH, SERVO_NEUTRAL_ANGLE);
+    delay(500);
+    Serial.println("[Servo] Calibration sequence complete.");
+    
     Serial.println("LEDC Servo initialized.");
     Serial.println("[Servo] Waiting for calibration... Keep horizontal for 5 seconds!");
 
